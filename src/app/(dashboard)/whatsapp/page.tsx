@@ -218,9 +218,9 @@ export default function WhatsAppPage() {
     void loadConversations();
   }, [loadConversations]);
 
-  /* ---- Poll conversations every 15s ---- */
+  /* ---- Poll conversations every 30s (Pusher covers real-time) ---- */
   useEffect(() => {
-    const id = setInterval(() => void loadConversations(), 15000);
+    const id = setInterval(() => void loadConversations(), 30000);
     return () => clearInterval(id);
   }, [loadConversations]);
 
@@ -230,10 +230,10 @@ export default function WhatsAppPage() {
     else setMessages([]);
   }, [activeId, loadMessages]);
 
-  /* ---- Poll active conversation messages every 5s ---- */
+  /* ---- Poll active conversation messages every 20s (Pusher covers real-time) ---- */
   useEffect(() => {
     if (!activeId) return;
-    const id = setInterval(() => void loadMessages(activeId), 5000);
+    const id = setInterval(() => void loadMessages(activeId), 20000);
     return () => clearInterval(id);
   }, [activeId, loadMessages]);
 

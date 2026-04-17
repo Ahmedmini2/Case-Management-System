@@ -113,29 +113,58 @@ export function CaseDetail({
 
   async function assignUser(userId: string) {
     if (!item) return;
-    await updateCase({ assignedToId: userId || null }, "Assignee updated.");
+    const nextAssignee = userId
+      ? users.find((u) => u.id === userId) ?? null
+      : null;
+    await updateCase(
+      { assignedToId: userId || null },
+      "Assignee updated.",
+      (prev) => ({
+        ...prev,
+        assignedTo: nextAssignee
+          ? { id: nextAssignee.id, name: nextAssignee.name, email: nextAssignee.email, image: nextAssignee.image ?? null }
+          : null,
+      }),
+    );
   }
 
   async function updateCase(
     payload: Partial<{ assignedToId: string | null; status: CaseStatus; priority: Priority }>,
     successMessage: string,
+    optimistic?: (prev: CaseDetailData) => CaseDetailData,
   ) {
     if (!item) return;
+    const snapshot = item;
+    const next = optimistic
+      ? optimistic(item)
+      : { ...item, ...(payload.status ? { status: payload.status } : {}), ...(payload.priority ? { priority: payload.priority } : {}) };
+    setItem(next);
     setUpdating(true);
-    const response = await fetch(`/api/cases/${item.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const result = (await response.json()) as { error: string | null };
-    setUpdating(false);
-    if (!response.ok) {
-      toast.error(result.error ?? "Failed to update case");
-      return;
+    try {
+      const response = await fetch(`/api/cases/${item.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const result = (await response.json()) as { error: string | null };
+        setItem(snapshot);
+        toast.error(result.error ?? "Failed to update case");
+        return;
+      }
+      toast.success(successMessage);
+    } catch (err) {
+      setItem(snapshot);
+      toast.error("Network error. Please try again.");
+    } finally {
+      setUpdating(false);
     }
-    toast.success(successMessage);
-    await load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }
+
+  function handleCommentCreated(
+    created: CaseDetailData["comments"][number],
+  ) {
+    setItem((prev) => (prev ? { ...prev, comments: [created, ...prev.comments] } : prev));
   }
 
   if (loading) return <CaseDetailSkeleton />;
@@ -299,7 +328,7 @@ export function CaseDetail({
           <CaseTimeline items={item.activities} />
         </TabsContent>
         <TabsContent value="comments" className="mt-4 space-y-4">
-          <CommentEditor caseId={item.id} onCreated={load} />
+          <CommentEditor caseId={item.id} onCreated={handleCommentCreated} />
           <CommentList comments={item.comments} />
         </TabsContent>
         <TabsContent value="emails" className="mt-4">

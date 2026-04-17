@@ -1,5 +1,5 @@
 import { ActivityType, CaseStatus, Priority } from "@prisma/client";
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { runAutomationEngine } from "@/lib/automations/engine";
@@ -211,85 +211,113 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     return nextCase;
   });
 
-  await writeAudit({
-    userId: session.user.id,
-    caseId: id,
-    action: "CASE_UPDATED",
-    resource: "case",
-    resourceId: id,
-    before: existing,
-    after: updated,
-    req: request,
-  });
+  const actorUserId = session.user.id;
+  const recipientEmail = session.user.email ?? null;
 
-  await triggerPusherEvent("cases", "case:updated", {
-    id: updated.id,
-    caseNumber: updated.caseNumber,
-    title: updated.title,
-    pipelineStageId: parsed.data.pipelineStageId ?? null,
-  });
-
-  const recipient = session.user.email;
-  if (recipient && (parsed.data.status || parsed.data.priority)) {
-    const emailRecord = await db.email.create({
-      data: {
+  after(async () => {
+    try {
+      await writeAudit({
+        userId: actorUserId,
         caseId: id,
-        subject: `Case updated: ${updated.caseNumber}`,
-        body: "A case was updated.",
-        bodyText: "A case was updated.",
-        direction: "OUTBOUND",
-        from: process.env.EMAIL_FROM ?? "support@example.com",
-        to: [recipient],
-        cc: [],
-        bcc: [],
-        status: "PENDING",
-      },
-      select: { id: true },
-    });
+        action: "CASE_UPDATED",
+        resource: "case",
+        resourceId: id,
+        before: existing,
+        after: updated,
+        req: request,
+      });
+    } catch (err) {
+      console.error("[case:update] audit failed", err);
+    }
 
-    await enqueueEmailJob({
-      emailId: emailRecord.id,
-      to: [recipient],
-      subject: `Case updated: ${updated.caseNumber}`,
-      caseNumber: updated.caseNumber,
-      caseTitle: updated.title,
-      status: updated.status,
-      priority: updated.priority,
-      assignee: null,
-      updateMessage: "Status or priority changed.",
-      caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
-    });
-  }
+    try {
+      await triggerPusherEvent("cases", "case:updated", {
+        id: updated.id,
+        caseNumber: updated.caseNumber,
+        title: updated.title,
+        pipelineStageId: parsed.data.pipelineStageId ?? null,
+      });
+    } catch (err) {
+      console.error("[case:update] pusher failed", err);
+    }
 
-  if (parsed.data.status) {
-    await runAutomationEngine({
-      triggerType: "CASE_STATUS_CHANGED",
-      caseId: id,
-      actorUserId: session.user.id,
-      payload: { oldStatus: existing.status, newStatus: parsed.data.status },
-    });
-  }
+    if (recipientEmail && (parsed.data.status || parsed.data.priority)) {
+      try {
+        const emailRecord = await db.email.create({
+          data: {
+            caseId: id,
+            subject: `Case updated: ${updated.caseNumber}`,
+            body: "A case was updated.",
+            bodyText: "A case was updated.",
+            direction: "OUTBOUND",
+            from: process.env.EMAIL_FROM ?? "support@example.com",
+            to: [recipientEmail],
+            cc: [],
+            bcc: [],
+            status: "PENDING",
+          },
+          select: { id: true },
+        });
 
-  if (parsed.data.priority) {
-    await runAutomationEngine({
-      triggerType: "CASE_PRIORITY_CHANGED",
-      caseId: id,
-      actorUserId: session.user.id,
-      payload: { oldPriority: existing.priority, newPriority: parsed.data.priority },
-    });
-  }
+        await enqueueEmailJob({
+          emailId: emailRecord.id,
+          to: [recipientEmail],
+          subject: `Case updated: ${updated.caseNumber}`,
+          caseNumber: updated.caseNumber,
+          caseTitle: updated.title,
+          status: updated.status,
+          priority: updated.priority,
+          assignee: null,
+          updateMessage: "Status or priority changed.",
+          caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
+        });
+      } catch (err) {
+        console.error("[case:update] email job failed", err);
+      }
+    }
 
-  if (
-    typeof parsed.data.pipelineStageId !== "undefined" &&
-    parsed.data.pipelineStageId !== existing.pipelineStageId
-  ) {
-    await runAutomationEngine({
-      triggerType: "STAGE_CHANGED",
-      caseId: id,
-      actorUserId: session.user.id,
-      payload: { oldStageId: existing.pipelineStageId, newStageId: parsed.data.pipelineStageId },
-    });
-  }
+    if (parsed.data.status) {
+      try {
+        await runAutomationEngine({
+          triggerType: "CASE_STATUS_CHANGED",
+          caseId: id,
+          actorUserId,
+          payload: { oldStatus: existing.status, newStatus: parsed.data.status },
+        });
+      } catch (err) {
+        console.error("[case:update] automation STATUS failed", err);
+      }
+    }
+
+    if (parsed.data.priority) {
+      try {
+        await runAutomationEngine({
+          triggerType: "CASE_PRIORITY_CHANGED",
+          caseId: id,
+          actorUserId,
+          payload: { oldPriority: existing.priority, newPriority: parsed.data.priority },
+        });
+      } catch (err) {
+        console.error("[case:update] automation PRIORITY failed", err);
+      }
+    }
+
+    if (
+      typeof parsed.data.pipelineStageId !== "undefined" &&
+      parsed.data.pipelineStageId !== existing.pipelineStageId
+    ) {
+      try {
+        await runAutomationEngine({
+          triggerType: "STAGE_CHANGED",
+          caseId: id,
+          actorUserId,
+          payload: { oldStageId: existing.pipelineStageId, newStageId: parsed.data.pipelineStageId },
+        });
+      } catch (err) {
+        console.error("[case:update] automation STAGE failed", err);
+      }
+    }
+  });
 
   return NextResponse.json(ok(updated));
 }

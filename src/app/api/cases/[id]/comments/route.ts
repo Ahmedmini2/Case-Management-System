@@ -1,5 +1,5 @@
 import { ActivityType } from "@prisma/client";
-import { NextResponse } from "next/server";
+import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { runAutomationEngine } from "@/lib/automations/engine";
@@ -70,6 +70,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         body: true,
         isInternal: true,
         createdAt: true,
+        author: { select: { id: true, name: true, email: true } },
       },
     });
 
@@ -85,59 +86,78 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return created;
   });
 
-  await writeAudit({
-    userId: session.user.id,
-    caseId: id,
-    action: "COMMENT_ADDED",
-    resource: "comment",
-    resourceId: comment.id,
-    after: comment,
-    req: request,
-  });
+  const actorUserId = session.user.id;
+  const actorEmail = session.user.email ?? null;
+  const isInternal = parsed.data.isInternal;
+  const body = parsed.data.body;
 
-  if (!parsed.data.isInternal && session.user.email) {
-    const caseInfo = await db.case.findUnique({
-      where: { id },
-      select: { caseNumber: true, title: true, status: true, priority: true },
-    });
-
-    if (caseInfo) {
-      const emailRecord = await db.email.create({
-        data: {
-          caseId: id,
-          subject: `New comment on ${caseInfo.caseNumber}`,
-          body: parsed.data.body,
-          bodyText: parsed.data.body,
-          direction: "OUTBOUND",
-          from: process.env.EMAIL_FROM ?? "support@example.com",
-          to: [session.user.email],
-          cc: [],
-          bcc: [],
-          status: "PENDING",
-        },
-        select: { id: true },
+  after(async () => {
+    try {
+      await writeAudit({
+        userId: actorUserId,
+        caseId: id,
+        action: "COMMENT_ADDED",
+        resource: "comment",
+        resourceId: comment.id,
+        after: comment,
+        req: request,
       });
-
-      await enqueueEmailJob({
-        emailId: emailRecord.id,
-        to: [session.user.email],
-        subject: `New comment on ${caseInfo.caseNumber}`,
-        caseNumber: caseInfo.caseNumber,
-        caseTitle: caseInfo.title,
-        status: caseInfo.status,
-        priority: caseInfo.priority,
-        assignee: null,
-        updateMessage: parsed.data.body,
-        caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
-      });
+    } catch (err) {
+      console.error("[comment:create] audit failed", err);
     }
-  }
 
-  await runAutomationEngine({
-    triggerType: "COMMENT_ADDED",
-    caseId: id,
-    actorUserId: session.user.id,
-    payload: { isInternal: parsed.data.isInternal },
+    if (!isInternal && actorEmail) {
+      try {
+        const caseInfo = await db.case.findUnique({
+          where: { id },
+          select: { caseNumber: true, title: true, status: true, priority: true },
+        });
+
+        if (caseInfo) {
+          const emailRecord = await db.email.create({
+            data: {
+              caseId: id,
+              subject: `New comment on ${caseInfo.caseNumber}`,
+              body,
+              bodyText: body,
+              direction: "OUTBOUND",
+              from: process.env.EMAIL_FROM ?? "support@example.com",
+              to: [actorEmail],
+              cc: [],
+              bcc: [],
+              status: "PENDING",
+            },
+            select: { id: true },
+          });
+
+          await enqueueEmailJob({
+            emailId: emailRecord.id,
+            to: [actorEmail],
+            subject: `New comment on ${caseInfo.caseNumber}`,
+            caseNumber: caseInfo.caseNumber,
+            caseTitle: caseInfo.title,
+            status: caseInfo.status,
+            priority: caseInfo.priority,
+            assignee: null,
+            updateMessage: body,
+            caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
+          });
+        }
+      } catch (err) {
+        console.error("[comment:create] email job failed", err);
+      }
+    }
+
+    try {
+      await runAutomationEngine({
+        triggerType: "COMMENT_ADDED",
+        caseId: id,
+        actorUserId,
+        payload: { isInternal },
+      });
+    } catch (err) {
+      console.error("[comment:create] automation failed", err);
+    }
   });
 
   return NextResponse.json(ok(comment), { status: 201 });
