@@ -18,6 +18,8 @@
     "@hookform/resolvers": "^5.2.2",
     "@prisma/client": "^6.19.3",
     "@react-email/components": "^1.0.12",
+    "@supabase/ssr": "^0.10.2",
+    "@supabase/supabase-js": "^2.103.3",
     "@uploadthing/react": "^7.3.3",
     "bcryptjs": "^3.0.3",
     "bullmq": "^5.73.3",
