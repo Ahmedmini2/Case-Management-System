@@ -1,14 +1,14 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useState, Suspense } from "react";
 import { signIn } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { LayoutList, Lock, Mail, ArrowRight, ShieldCheck } from "lucide-react";
+import { Lock, Mail, ArrowRight, ShieldCheck } from "lucide-react";
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const callbackUrl = searchParams.get("callbackUrl") ?? "/cases";
@@ -40,37 +40,37 @@ export default function LoginPage() {
   return (
     <div className="flex min-h-screen">
       {/* Left panel — brand */}
-      <div className="hidden lg:flex lg:w-1/2 flex-col justify-between bg-primary p-12">
+      <div className="hidden lg:flex lg:w-1/2 flex-col justify-between bg-[#1a1a1a] p-12">
         <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/15">
-            <LayoutList className="h-5 w-5 text-white" />
+          <div className="flex h-10 w-10 items-center justify-center rounded bg-[#df5641]">
+            <span className="text-lg font-black text-white leading-none">D</span>
           </div>
-          <span className="text-xl font-bold text-white tracking-tight">CaseFlow</span>
+          <span className="text-xl font-bold text-white tracking-widest uppercase">The Dungeon</span>
         </div>
 
         <div className="space-y-6">
-          <h1 className="text-4xl font-bold leading-tight text-white">
-            Streamline your<br />case management.
+          <h1 className="text-4xl font-bold leading-tight text-white uppercase tracking-wide">
+            Support<br />Hub.
           </h1>
-          <p className="text-lg text-primary-foreground/70 leading-relaxed max-w-sm">
-            Track, prioritize, and resolve cases efficiently with your team — all in one place.
+          <p className="text-lg text-white/50 leading-relaxed max-w-sm">
+            Manage cases, WhatsApp conversations, and customer support — all in one place.
           </p>
 
           <div className="space-y-3 pt-2">
             {[
-              "Real-time collaboration with your team",
+              "WhatsApp AI agent integration",
               "Automated SLA tracking and alerts",
-              "Custom pipelines and workflows",
+              "Broadcast messaging to customers",
             ].map((feature) => (
               <div key={feature} className="flex items-center gap-2.5">
-                <ShieldCheck className="h-4 w-4 text-white/60 shrink-0" />
-                <span className="text-sm text-primary-foreground/80">{feature}</span>
+                <ShieldCheck className="h-4 w-4 text-[#df5641] shrink-0" />
+                <span className="text-sm text-white/70">{feature}</span>
               </div>
             ))}
           </div>
         </div>
 
-        <p className="text-xs text-primary-foreground/40">© {new Date().getFullYear()} CaseFlow. All rights reserved.</p>
+        <p className="text-xs text-white/20">© {new Date().getFullYear()} The Dungeon Gear · Dubai, UAE</p>
       </div>
 
       {/* Right panel — form */}
@@ -78,10 +78,10 @@ export default function LoginPage() {
         <div className="w-full max-w-sm">
           {/* Mobile logo */}
           <div className="mb-8 flex items-center gap-2.5 lg:hidden">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
-              <LayoutList className="h-4 w-4 text-primary-foreground" />
+            <div className="flex h-8 w-8 items-center justify-center rounded bg-[#df5641]">
+              <span className="text-sm font-black text-white leading-none">D</span>
             </div>
-            <span className="text-lg font-bold tracking-tight">CaseFlow</span>
+            <span className="text-lg font-bold tracking-widest uppercase">The Dungeon</span>
           </div>
 
           <div className="mb-8">
@@ -161,5 +161,13 @@ export default function LoginPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
   );
 }
