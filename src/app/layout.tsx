@@ -3,6 +3,7 @@ import { Catamaran, Libre_Franklin, JetBrains_Mono } from "next/font/google";
 import { ThemeProvider } from "@/components/providers/ThemeProvider";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 import "./globals.css";
 
 const themeInitScript = `(function(){try{var t=localStorage.getItem("theme")||"system";var d=t==="dark"||(t==="system"&&window.matchMedia("(prefers-color-scheme: dark)").matches);var e=document.documentElement;e.classList.remove("light","dark");e.classList.add(d?"dark":"light");e.style.colorScheme=d?"dark":"light";}catch(e){}})();`;
@@ -50,6 +51,7 @@ export default function RootLayout({
             <Toaster />
           </TooltipProvider>
         </ThemeProvider>
+        <SpeedInsights />
       </body>
     </html>
   );
