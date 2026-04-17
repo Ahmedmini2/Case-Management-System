@@ -1,0 +1,678 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  role          UserRole  @default(AGENT)
+  isActive      Boolean   @default(true)
+  timezone      String    @default("UTC")
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  assignedCases Case[]        @relation("AssignedTo")
+  createdCases  Case[]        @relation("CreatedBy")
+  activities    Activity[]
+  comments      Comment[]
+  auditLogs     AuditLog[]
+  teamMembers   TeamMember[]
+  notifications Notification[]
+  attachments   Attachment[]
+  watchedCases  CaseWatcher[]
+
+  @@map("users")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  MANAGER
+  AGENT
+  VIEWER
+  CUSTOMER
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+model Team {
+  id          String       @id @default(cuid())
+  name        String
+  description String?
+  color       String?      @default("#6366f1")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  members     TeamMember[]
+  cases       Case[]
+
+  @@map("teams")
+}
+
+model TeamMember {
+  id        String   @id @default(cuid())
+  teamId    String
+  userId    String
+  role      TeamRole @default(MEMBER)
+  createdAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@map("team_members")
+}
+
+enum TeamRole {
+  LEAD
+  MEMBER
+}
+
+model Case {
+  id              String        @id @default(cuid())
+  caseNumber      String        @unique
+  title           String
+  description     String?       @db.Text
+  status          CaseStatus    @default(OPEN)
+  priority        Priority      @default(MEDIUM)
+  type            String?
+  source          CaseSource    @default(MANUAL)
+  externalId      String?
+  externalMeta    Json?
+  assignedToId    String?
+  createdById     String
+  teamId          String?
+  contactId       String?
+  pipelineId      String?
+  pipelineStageId String?
+  dueDate         DateTime?
+  resolvedAt      DateTime?
+  closedAt        DateTime?
+  firstResponseAt DateTime?
+  slaBreachedAt   DateTime?
+  customFields    Json?
+  metadata        Json?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  assignedTo      User?          @relation("AssignedTo", fields: [assignedToId], references: [id])
+  createdBy       User           @relation("CreatedBy", fields: [createdById], references: [id])
+  team            Team?          @relation(fields: [teamId], references: [id])
+  contact         Contact?       @relation(fields: [contactId], references: [id])
+  pipeline        Pipeline?      @relation(fields: [pipelineId], references: [id])
+  pipelineStage   PipelineStage? @relation(fields: [pipelineStageId], references: [id])
+  tags            CaseTag[]
+  activities      Activity[]
+  comments        Comment[]
+  attachments     Attachment[]
+  emails          Email[]
+  auditLogs       AuditLog[]
+  notifications   Notification[]
+  automationRuns  AutomationRun[]
+  watchers        CaseWatcher[]
+
+  @@index([status])
+  @@index([priority])
+  @@index([assignedToId])
+  @@index([createdAt])
+  @@index([caseNumber])
+  @@map("cases")
+}
+
+enum CaseStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_ON_CUSTOMER
+  WAITING_ON_THIRD_PARTY
+  RESOLVED
+  CLOSED
+  CANCELLED
+}
+
+enum Priority {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum CaseSource {
+  MANUAL
+  EMAIL
+  ZAPIER
+  API
+  PORTAL
+  PHONE
+  CHAT
+}
+
+model Pipeline {
+  id          String          @id @default(cuid())
+  name        String
+  description String?
+  isDefault   Boolean         @default(false)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  stages      PipelineStage[]
+  cases       Case[]
+
+  @@map("pipelines")
+}
+
+model PipelineStage {
+  id          String    @id @default(cuid())
+  pipelineId  String
+  name        String
+  description String?
+  color       String    @default("#6366f1")
+  position    Int       @default(0)
+  isTerminal  Boolean   @default(false)
+  autoActions Json?
+
+  pipeline    Pipeline  @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  cases       Case[]
+
+  @@unique([pipelineId, position])
+  @@map("pipeline_stages")
+}
+
+model Tag {
+  id        String    @id @default(cuid())
+  name      String    @unique
+  color     String    @default("#6366f1")
+  createdAt DateTime  @default(now())
+
+  cases     CaseTag[]
+
+  @@map("tags")
+}
+
+model CaseTag {
+  caseId String
+  tagId  String
+
+  case   Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  tag    Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([caseId, tagId])
+  @@map("case_tags")
+}
+
+model Contact {
+  id           String   @id @default(cuid())
+  name         String
+  email        String?  @unique
+  phone        String?
+  company      String?
+  avatarUrl    String?
+  notes        String?  @db.Text
+  customFields Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  cases        Case[]
+
+  @@map("contacts")
+}
+
+model Comment {
+  id           String   @id @default(cuid())
+  caseId       String
+  authorId     String
+  body         String   @db.Text
+  isInternal   Boolean  @default(false)
+  isResolution Boolean  @default(false)
+  editedAt     DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  case         Case     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  author       User     @relation(fields: [authorId], references: [id])
+  attachments  Attachment[]
+
+  @@map("comments")
+}
+
+model Activity {
+  id          String       @id @default(cuid())
+  caseId      String
+  userId      String?
+  type        ActivityType
+  description String
+  oldValue    String?
+  newValue    String?
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+
+  case        Case         @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  user        User?        @relation(fields: [userId], references: [id])
+
+  @@index([caseId, createdAt])
+  @@map("activities")
+}
+
+enum ActivityType {
+  CREATED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  ASSIGNED
+  UNASSIGNED
+  TAG_ADDED
+  TAG_REMOVED
+  COMMENT_ADDED
+  EMAIL_SENT
+  EMAIL_RECEIVED
+  STAGE_CHANGED
+  ATTACHMENT_ADDED
+  FIELD_UPDATED
+  DUE_DATE_SET
+  SLA_BREACHED
+  AUTOMATION_TRIGGERED
+  MERGED
+}
+
+model Email {
+  id          String      @id @default(cuid())
+  caseId      String
+  messageId   String?     @unique
+  threadId    String?
+  subject     String
+  body        String      @db.Text
+  bodyText    String?     @db.Text
+  direction   EmailDir
+  from        String
+  to          String[]
+  cc          String[]
+  bcc         String[]
+  headers     Json?
+  resendId    String?
+  status      EmailStatus @default(PENDING)
+  openedAt    DateTime?
+  sentAt      DateTime?
+  createdAt   DateTime    @default(now())
+
+  case        Case        @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  attachments Attachment[]
+
+  @@map("emails")
+}
+
+enum EmailDir {
+  INBOUND
+  OUTBOUND
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  DELIVERED
+  OPENED
+  BOUNCED
+  FAILED
+}
+
+model Attachment {
+  id           String   @id @default(cuid())
+  caseId       String?
+  commentId    String?
+  emailId      String?
+  uploadedById String?
+  fileName     String
+  fileSize     Int
+  mimeType     String
+  url          String
+  key          String
+  createdAt    DateTime @default(now())
+
+  case         Case?    @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  comment      Comment? @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  email        Email?   @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  uploadedBy   User?    @relation(fields: [uploadedById], references: [id])
+
+  @@map("attachments")
+}
+
+model Automation {
+  id          String      @id @default(cuid())
+  name        String
+  description String?
+  isActive    Boolean     @default(true)
+  trigger     Json
+  actions     Json
+  runCount    Int         @default(0)
+  lastRunAt   DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  runs        AutomationRun[]
+
+  @@map("automations")
+}
+
+model AutomationRun {
+  id           String    @id @default(cuid())
+  automationId String
+  caseId       String?
+  status       RunStatus @default(PENDING)
+  error        String?
+  result       Json?
+  createdAt    DateTime  @default(now())
+
+  automation   Automation @relation(fields: [automationId], references: [id])
+  case         Case?      @relation(fields: [caseId], references: [id])
+
+  @@map("automation_runs")
+}
+
+enum RunStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  caseId     String?
+  action     String
+  resource   String
+  resourceId String?
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  user       User?    @relation(fields: [userId], references: [id])
+  case       Case?    @relation(fields: [caseId], references: [id])
+
+  @@index([createdAt])
+  @@index([userId])
+  @@index([caseId])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  caseId    String?
+  type      String
+  title     String
+  body      String?
+  isRead    Boolean  @default(false)
+  link      String?
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  case      Case?    @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+model CaseWatcher {
+  caseId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  case      Case     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([caseId, userId])
+  @@map("case_watchers")
+}
+
+model SLAPolicy {
+  id                 String   @id @default(cuid())
+  name               String
+  firstResponseHours Int
+  resolutionHours    Int
+  priority           Priority @unique
+  businessHoursOnly  Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@map("sla_policies")
+}
+
+model CustomFieldDef {
+  id         String          @id @default(cuid())
+  name       String          @unique
+  label      String
+  type       CustomFieldType
+  options    Json?
+  isRequired Boolean         @default(false)
+  position   Int             @default(0)
+  createdAt  DateTime        @default(now())
+
+  @@map("custom_field_defs")
+}
+
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  DATE
+  SELECT
+  MULTISELECT
+  BOOLEAN
+  URL
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  name       String
+  keyHash    String    @unique
+  prefix     String
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  isActive   Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+
+  @@map("api_keys")
+}
+
+model WhatsAppConversation {
+  id            String     @id @default(cuid())
+  contactName   String
+  contactPhone  String     @unique
+  contactAvatar String?
+  lastMessage   String?
+  lastMessageAt DateTime   @default(now())
+  unreadCount   Int        @default(0)
+  status        ConvStatus @default(ACTIVE)
+  handledBy     HandledBy  @default(AI)
+  agentId       String?
+  caseId        String?
+  tags          String[]
+  metadata      Json?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  messages WhatsAppMessage[]
+
+  @@index([lastMessageAt])
+  @@index([status])
+  @@map("whatsapp_conversations")
+}
+
+enum ConvStatus {
+  ACTIVE
+  WAITING
+  RESOLVED
+  BLOCKED
+}
+
+enum HandledBy {
+  AI
+  HUMAN
+}
+
+model WhatsAppMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  whatsappMsgId  String?  @unique
+  direction      String   // 'inbound' | 'outbound'
+  sender         String   // 'customer' | 'ai' | 'agent'
+  senderName     String
+  body           String   @db.Text
+  mediaUrl       String?
+  mediaType      String?
+  isAI           Boolean  @default(false)
+  status         String   @default("sent")
+  isRead         Boolean  @default(false)
+  timestamp      DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  conversation WhatsAppConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, timestamp])
+  @@map("whatsapp_messages")
+}
+
+model WhatsAppTemplate {
+  id           String         @id @default(cuid())
+  metaId       String?        @unique
+  name         String         @unique
+  language     String         @default("en")
+  category     String         @default("MARKETING")
+  status       TemplateStatus @default(PENDING)
+  body         String         @db.Text
+  header       String?
+  footer       String?
+  buttons      Json?
+  variableCount Int           @default(0)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  broadcasts   Broadcast[]
+
+  @@map("whatsapp_templates")
+}
+
+enum TemplateStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAUSED
+  DISABLED
+}
+
+model Broadcast {
+  id            String           @id @default(cuid())
+  name          String
+  message       String           @db.Text
+  templateId    String?
+  templateVars  Json?
+  status        BroadcastStatus  @default(DRAFT)
+  totalCount    Int              @default(0)
+  sentCount     Int              @default(0)
+  deliveredCount Int             @default(0)
+  failedCount   Int              @default(0)
+  readCount     Int              @default(0)
+  scheduledAt   DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  createdById   String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  template      WhatsAppTemplate? @relation(fields: [templateId], references: [id])
+  recipients    BroadcastRecipient[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("broadcasts")
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model BroadcastRecipient {
+  id            String          @id @default(cuid())
+  broadcastId   String
+  phone         String
+  contactName   String?
+  status        RecipientStatus @default(PENDING)
+  whatsappMsgId String?
+  error         String?
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  readAt        DateTime?
+  createdAt     DateTime        @default(now())
+
+  broadcast     Broadcast       @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+
+  @@index([broadcastId, status])
+  @@map("broadcast_recipients")
+}
+
+enum RecipientStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
