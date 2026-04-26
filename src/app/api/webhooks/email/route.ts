@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { fail, ok } from "@/lib/api";
 import { generateCaseNumber } from "@/lib/case-number";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { enqueueEmailJob } from "@/lib/queue/jobs";
+import { getCaseNotifyRecipients } from "@/lib/notify";
 
 function verifySignature(rawBody: string, signature: string | null) {
   const secret = process.env.WEBHOOK_SECRET;
@@ -107,6 +109,75 @@ export async function POST(request: Request) {
     description: `Inbound email received: ${email.subject}`,
   });
   if (actErr) console.error("[webhooks/email] best-effort activity failed:", actErr.message);
+
+  // Notify the case assignee + always-notify list that a client replied
+  try {
+    const { data: caseInfo } = await sb
+      .from("cases")
+      .select("caseNumber, title, status, priority, assignedToId")
+      .eq("id", caseId)
+      .maybeSingle();
+    const ci = caseInfo as
+      | {
+          caseNumber: string;
+          title: string;
+          status: string;
+          priority: string;
+          assignedToId: string | null;
+        }
+      | null;
+
+    if (ci) {
+      let assigneeEmail: string | null = null;
+      if (ci.assignedToId) {
+        const { data: assignee } = await sb
+          .from("users")
+          .select("email")
+          .eq("id", ci.assignedToId)
+          .maybeSingle();
+        assigneeEmail = (assignee as { email: string } | null)?.email ?? null;
+      }
+
+      const notifyTo = getCaseNotifyRecipients(assigneeEmail);
+      const replyBody = body.text ?? body.html ?? "(no body)";
+      const trimmedBody = replyBody.length > 1000 ? replyBody.slice(0, 1000) + "…" : replyBody;
+      const fromAddr = body.from ?? "Customer";
+
+      const { data: notifyRow } = await sb
+        .from("emails")
+        .insert({
+          caseId,
+          subject: `Client reply on ${ci.caseNumber}: ${email.subject}`,
+          body: `Reply from ${fromAddr}:\n\n${trimmedBody}`,
+          bodyText: `Reply from ${fromAddr}:\n\n${trimmedBody}`,
+          direction: "OUTBOUND",
+          from: process.env.EMAIL_FROM ?? "support@example.com",
+          to: notifyTo,
+          cc: [],
+          bcc: [],
+          status: "PENDING",
+        })
+        .select("id")
+        .single();
+
+      if (notifyRow) {
+        await enqueueEmailJob({
+          emailId: (notifyRow as { id: string }).id,
+          to: notifyTo,
+          subject: `Client reply on ${ci.caseNumber}: ${email.subject}`,
+          caseNumber: ci.caseNumber,
+          caseTitle: ci.title,
+          status: ci.status,
+          priority: ci.priority,
+          assignee: null,
+          updateMessage: `Reply from ${fromAddr}:\n\n${trimmedBody}`,
+          caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${caseId}`,
+        });
+      }
+    }
+  } catch (err) {
+    console.error("[webhooks/email] notify failed:", err);
+  }
 
   return NextResponse.json(ok({ success: true, emailId: email.id, caseId: email.caseId }));
 }

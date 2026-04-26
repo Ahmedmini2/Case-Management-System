@@ -12,6 +12,7 @@ export function middleware(request: NextRequest) {
     pathname.startsWith("/api/whatsapp/ai-reply") ||
     pathname.startsWith("/api/auth") ||
     pathname.startsWith("/api/portal") ||
+    pathname.startsWith("/api/cron/") ||
     pathname.startsWith("/login") ||
     pathname.startsWith("/register") ||
     pathname === "/"
@@ -24,6 +25,11 @@ export function middleware(request: NextRequest) {
   if (pathname.startsWith("/api/")) {
     const authHeader = request.headers.get("authorization");
     if (authHeader?.startsWith("Bearer ")) {
+      return NextResponse.next();
+    }
+    // Internal cron-to-API calls (e.g., dispatch-broadcasts → send) carry x-cron-secret;
+    // the destination handler verifies it.
+    if (request.headers.get("x-cron-secret")) {
       return NextResponse.next();
     }
     console.log(

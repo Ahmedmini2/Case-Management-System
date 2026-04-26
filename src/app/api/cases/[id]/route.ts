@@ -395,6 +395,55 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       console.error("[case:update] pusher failed", err);
     }
 
+    // Notify the NEW assignee directly if assignment changed
+    const newAssigneeId =
+      typeof parsed.data.assignedToId !== "undefined" ? parsed.data.assignedToId : null;
+    const oldAssigneeId = (ex as { assignedToId?: string | null }).assignedToId ?? null;
+    if (newAssigneeId && newAssigneeId !== oldAssigneeId) {
+      try {
+        const { data: assignee } = await sbAfter
+          .from("users")
+          .select("name, email")
+          .eq("id", newAssigneeId)
+          .maybeSingle();
+        const a = assignee as { name: string | null; email: string } | null;
+        if (a?.email) {
+          const { data: emailRow } = await sbAfter
+            .from("emails")
+            .insert({
+              caseId: id,
+              subject: `Assigned to you: ${updated.caseNumber} — ${updated.title}`,
+              body: `You have been assigned case ${updated.caseNumber}: ${updated.title}.`,
+              bodyText: `You have been assigned case ${updated.caseNumber}: ${updated.title}.`,
+              direction: "OUTBOUND",
+              from: process.env.EMAIL_FROM ?? "support@example.com",
+              to: [a.email],
+              cc: [],
+              bcc: [],
+              status: "PENDING",
+            })
+            .select("id")
+            .single();
+          if (emailRow) {
+            await enqueueEmailJob({
+              emailId: (emailRow as { id: string }).id,
+              to: [a.email],
+              subject: `Assigned to you: ${updated.caseNumber} — ${updated.title}`,
+              caseNumber: updated.caseNumber,
+              caseTitle: updated.title,
+              status: updated.status,
+              priority: updated.priority,
+              assignee: a.name ?? a.email,
+              updateMessage: "This case has been assigned to you.",
+              caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
+            });
+          }
+        }
+      } catch (err) {
+        console.error("[case:update] assignee email failed", err);
+      }
+    }
+
     // Notify on every update (status, priority, assignee, due date, etc.)
     const recipients = getCaseNotifyRecipients(recipientEmail);
     if (recipients.length > 0) {

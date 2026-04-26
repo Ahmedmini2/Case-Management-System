@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import {
   Send, Upload, Plus, Trash2, Play, CheckCircle2, XCircle, Clock,
   Loader2, FileSpreadsheet, Users, ArrowLeft, X, Phone, AlertCircle,
-  Radio, RefreshCw, FileText, Sparkles,
+  Radio, RefreshCw, FileText, Sparkles, Clock,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -124,6 +124,9 @@ export default function BroadcastPage() {
   const [manualName, setManualName] = useState("");
   const [creating, setCreating] = useState(false);
   const [sendingId, setSendingId] = useState<string | null>(null);
+
+  // Schedule for create form
+  const [formScheduledAt, setFormScheduledAt] = useState("");
 
   // Template create form
   const [tplName, setTplName] = useState("");
@@ -279,17 +282,36 @@ export default function BroadcastPage() {
     if (!formName.trim() || !selectedTemplateId || formRecipients.length === 0) {
       toast.error("Fill all required fields"); return;
     }
+
+    // If scheduled, convert the local datetime input to an ISO string
+    let scheduledAtIso: string | null = null;
+    if (formScheduledAt.trim()) {
+      const when = new Date(formScheduledAt);
+      if (Number.isNaN(when.getTime())) { toast.error("Invalid schedule date/time"); return; }
+      if (when.getTime() <= Date.now() + 30_000) {
+        toast.error("Scheduled time must be in the future");
+        return;
+      }
+      scheduledAtIso = when.toISOString();
+    }
+
     setCreating(true);
     try {
       const res = await fetch("/api/whatsapp/broadcasts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: formName, templateId: selectedTemplateId, templateVars, recipients: formRecipients }),
+        body: JSON.stringify({
+          name: formName,
+          templateId: selectedTemplateId,
+          templateVars,
+          recipients: formRecipients,
+          scheduledAt: scheduledAtIso,
+        }),
       });
       const json = (await res.json()) as { error?: string };
       if (!res.ok) { toast.error(json.error ?? "Failed"); setCreating(false); return; }
-      toast.success("Broadcast created");
-      setFormName(""); setSelectedTemplateId(""); setTemplateVars({}); setFormRecipients([]);
+      toast.success(scheduledAtIso ? "Broadcast scheduled" : "Broadcast created");
+      setFormName(""); setSelectedTemplateId(""); setTemplateVars({}); setFormRecipients([]); setFormScheduledAt("");
       setView("list"); await loadBroadcasts();
     } catch { toast.error("Failed"); }
     setCreating(false);
@@ -711,10 +733,42 @@ export default function BroadcastPage() {
               <p className="text-[10px] text-muted-foreground/50">CSV: one number per line, or phone,name columns</p>
             </div>
 
+            {/* Schedule (optional) */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                  Schedule (optional)
+                </label>
+                {formScheduledAt && (
+                  <button
+                    type="button"
+                    onClick={() => setFormScheduledAt("")}
+                    className="text-[10px] text-muted-foreground hover:text-foreground"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <Clock className="h-4 w-4 text-muted-foreground shrink-0" />
+                <input
+                  type="datetime-local"
+                  value={formScheduledAt}
+                  onChange={(e) => setFormScheduledAt(e.target.value)}
+                  min={new Date(Date.now() + 60_000).toISOString().slice(0, 16)}
+                  className="flex-1 rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+                />
+              </div>
+              <p className="text-[10px] text-muted-foreground/60">
+                Leave blank to create as a draft and send manually. If set, the broadcast will fire automatically at the chosen time (cron runs every minute).
+              </p>
+            </div>
+
             {/* Submit */}
             <div className="flex items-center gap-3 pt-2">
               <button onClick={() => void handleCreate()} disabled={creating || !formName.trim() || !selectedTemplateId || formRecipients.length === 0} className="inline-flex items-center gap-2 rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/80 disabled:opacity-50 disabled:cursor-not-allowed">
-                {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />} Create Broadcast
+                {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : formScheduledAt ? <Clock className="h-4 w-4" /> : <Send className="h-4 w-4" />}
+                {formScheduledAt ? "Schedule Broadcast" : "Create Broadcast"}
               </button>
               <button onClick={() => setView("list")} className="rounded-lg px-4 py-2.5 text-sm text-muted-foreground hover:bg-muted">Cancel</button>
             </div>

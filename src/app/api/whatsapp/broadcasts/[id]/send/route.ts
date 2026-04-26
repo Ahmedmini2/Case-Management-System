@@ -4,9 +4,14 @@ import { auth } from "@/lib/auth";
 import { supabaseAdmin } from "@/lib/supabase/admin";
 
 // Send a broadcast — processes all pending recipients using the WhatsApp template
-export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
-  const session = await auth();
-  if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  // Allow either an authenticated user OR a cron call with the matching secret
+  const cronSecret = process.env.CRON_SECRET;
+  const isCron = cronSecret && request.headers.get("x-cron-secret") === cronSecret;
+  if (!isCron) {
+    const session = await auth();
+    if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
+  }
 
   const { id } = await params;
   const sb = supabaseAdmin();

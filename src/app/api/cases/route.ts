@@ -460,6 +460,47 @@ export async function POST(request: Request) {
           caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${newCase.id}`,
         });
       })().catch((e) => console.error("[POST /api/cases] Email error:", e)),
+      // Notify the assignee directly if one was set at creation time
+      (async () => {
+        if (!parsed.data.assignedToId) return;
+        const { data: assignee } = await sb
+          .from("users")
+          .select("name, email")
+          .eq("id", parsed.data.assignedToId)
+          .maybeSingle();
+        const a = assignee as { name: string | null; email: string } | null;
+        if (!a?.email) return;
+        const { data: emailRow } = await sb
+          .from("emails")
+          .insert({
+            caseId: newCase.id,
+            subject: `Assigned to you: ${newCase.caseNumber} — ${newCase.title}`,
+            body: `You have been assigned case ${newCase.caseNumber}: ${newCase.title}.`,
+            bodyText: `You have been assigned case ${newCase.caseNumber}: ${newCase.title}.`,
+            direction: "OUTBOUND",
+            from: process.env.EMAIL_FROM ?? "support@example.com",
+            to: [a.email],
+            cc: [],
+            bcc: [],
+            status: "PENDING",
+          })
+          .select("id")
+          .single();
+        if (emailRow) {
+          await enqueueEmailJob({
+            emailId: (emailRow as { id: string }).id,
+            to: [a.email],
+            subject: `Assigned to you: ${newCase.caseNumber} — ${newCase.title}`,
+            caseNumber: newCase.caseNumber,
+            caseTitle: newCase.title,
+            status: newCase.status,
+            priority: newCase.priority,
+            assignee: a.name ?? a.email,
+            updateMessage: "This case has been assigned to you.",
+            caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${newCase.id}`,
+          });
+        }
+      })().catch((e) => console.error("[POST /api/cases] Assignee email error:", e)),
     ]).catch(() => {});
 
     // Hydrate contact for the response so the caller can confirm what was linked

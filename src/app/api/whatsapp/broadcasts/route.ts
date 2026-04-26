@@ -51,12 +51,26 @@ export async function POST(request: Request) {
     templateId?: string;
     templateVars?: Record<string, string>;
     recipients?: { phone: string; contactName?: string }[];
+    scheduledAt?: string | null;
   };
 
   const name = typeof body.name === "string" ? body.name.trim() : "";
   const templateId = typeof body.templateId === "string" ? body.templateId : null;
   const templateVars = body.templateVars && typeof body.templateVars === "object" ? body.templateVars : null;
   const recipients = Array.isArray(body.recipients) ? body.recipients : [];
+
+  // Optional schedule: must be in the future. Empty/missing = send via the existing manual flow.
+  let scheduledAtIso: string | null = null;
+  if (typeof body.scheduledAt === "string" && body.scheduledAt.trim()) {
+    const when = new Date(body.scheduledAt);
+    if (Number.isNaN(when.getTime())) {
+      return NextResponse.json(fail("scheduledAt is not a valid date/time"), { status: 400 });
+    }
+    if (when.getTime() <= Date.now() + 30_000) {
+      return NextResponse.json(fail("scheduledAt must be at least 30 seconds in the future"), { status: 400 });
+    }
+    scheduledAtIso = when.toISOString();
+  }
 
   if (!name) return NextResponse.json(fail("Broadcast name is required"), { status: 400 });
   if (!templateId) return NextResponse.json(fail("Please select a message template"), { status: 400 });
@@ -110,11 +124,12 @@ export async function POST(request: Request) {
       message: previewMessage,
       templateId,
       templateVars: templateVars ?? null,
-      status: "DRAFT",
+      status: scheduledAtIso ? "SCHEDULED" : "DRAFT",
+      scheduledAt: scheduledAtIso,
       totalCount: unique.length,
       createdById: session.user.id,
     })
-    .select("id, name, status, totalCount, createdAt")
+    .select("id, name, status, totalCount, scheduledAt, createdAt")
     .single();
 
   if (bErr || !broadcast) return NextResponse.json(fail(bErr?.message ?? "Failed to create broadcast"), { status: 500 });
