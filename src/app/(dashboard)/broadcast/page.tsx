@@ -641,8 +641,14 @@ export default function BroadcastPage() {
         <div className="flex items-center gap-3">
           <button onClick={() => setView("list")} className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted"><ArrowLeft className="h-4 w-4" /></button>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">New Broadcast</h1>
-            <p className="text-xs text-muted-foreground">Select an approved template, fill variables, and upload recipients</p>
+            <h1 className="text-xl font-bold tracking-tight">
+              New Broadcast
+              <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide align-middle">
+                <Clock className="h-3 w-3" />
+                Scheduling enabled
+              </span>
+            </h1>
+            <p className="text-xs text-muted-foreground">Select an approved template, fill variables, upload recipients, and optionally schedule.</p>
           </div>
         </div>
 
