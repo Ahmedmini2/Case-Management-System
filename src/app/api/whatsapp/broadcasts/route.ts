@@ -1,22 +1,44 @@
 import { NextResponse } from "next/server";
 import { ok, fail } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 // List all broadcasts
 export async function GET() {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const broadcasts = await db.broadcast.findMany({
-    orderBy: { createdAt: "desc" },
-    take: 100,
-    include: {
-      template: { select: { id: true, name: true, status: true } },
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("broadcasts")
+    .select("*")
+    .order("createdAt", { ascending: false })
+    .limit(100);
 
-  return NextResponse.json(ok(broadcasts));
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  type BroadcastRow = { templateId: string | null } & Record<string, unknown>;
+  const broadcasts = ((data as BroadcastRow[] | null) ?? []);
+
+  // Hydrate templates
+  const templateIds = [...new Set(broadcasts.map((b) => b.templateId).filter(Boolean))] as string[];
+  const templateMap = new Map<string, { id: string; name: string; status: string }>();
+  if (templateIds.length > 0) {
+    const { data: templates } = await sb
+      .from("whatsapp_templates")
+      .select("id, name, status")
+      .in("id", templateIds);
+    for (const t of (templates ?? []) as { id: string; name: string; status: string }[]) {
+      templateMap.set(t.id, t);
+    }
+  }
+
+  const enriched = broadcasts.map((b) => ({
+    ...b,
+    template: b.templateId ? templateMap.get(b.templateId) ?? null : null,
+  }));
+
+  return NextResponse.json(ok(enriched));
 }
 
 // Create a new broadcast (draft)
@@ -40,22 +62,31 @@ export async function POST(request: Request) {
   if (!templateId) return NextResponse.json(fail("Please select a message template"), { status: 400 });
   if (recipients.length === 0) return NextResponse.json(fail("At least one recipient is required"), { status: 400 });
 
-  // Verify template exists and is approved
-  const template = await db.whatsAppTemplate.findUnique({ where: { id: templateId } });
+  const sb = supabaseAdmin();
+
+  // Verify template
+  const { data: template, error: tErr } = await sb
+    .from("whatsapp_templates")
+    .select("id, name, status, body")
+    .eq("id", templateId)
+    .maybeSingle();
+
+  if (tErr) return NextResponse.json(fail(tErr.message), { status: 500 });
   if (!template) return NextResponse.json(fail("Template not found"), { status: 404 });
-  if (template.status !== "APPROVED") {
-    return NextResponse.json(fail(`Template "${template.name}" is not approved yet (status: ${template.status}). Only approved templates can be used for broadcasts.`), { status: 400 });
+  const t = template as { id: string; name: string; status: string; body: string };
+  if (t.status !== "APPROVED") {
+    return NextResponse.json(fail(`Template "${t.name}" is not approved yet (status: ${t.status}). Only approved templates can be used for broadcasts.`), { status: 400 });
   }
 
   // Build the preview message from template
-  let previewMessage = template.body;
+  let previewMessage = t.body;
   if (templateVars) {
     for (const [key, value] of Object.entries(templateVars)) {
       previewMessage = previewMessage.replace(`{{${key}}}`, value);
     }
   }
 
-  // Normalize and deduplicate phone numbers
+  // Normalize and dedupe phone numbers
   const seen = new Set<string>();
   const unique = recipients
     .map((r) => ({
@@ -72,30 +103,35 @@ export async function POST(request: Request) {
 
   if (unique.length === 0) return NextResponse.json(fail("No valid phone numbers found"), { status: 400 });
 
-  const broadcast = await db.broadcast.create({
-    data: {
+  const { data: broadcast, error: bErr } = await sb
+    .from("broadcasts")
+    .insert({
       name,
       message: previewMessage,
       templateId,
-      templateVars: templateVars ?? undefined,
+      templateVars: templateVars ?? null,
       status: "DRAFT",
       totalCount: unique.length,
       createdById: session.user.id,
-      recipients: {
-        create: unique.map((r) => ({
-          phone: r.phone,
-          contactName: r.contactName,
-        })),
-      },
-    },
-    select: {
-      id: true,
-      name: true,
-      status: true,
-      totalCount: true,
-      createdAt: true,
-    },
-  });
+    })
+    .select("id, name, status, totalCount, createdAt")
+    .single();
+
+  if (bErr || !broadcast) return NextResponse.json(fail(bErr?.message ?? "Failed to create broadcast"), { status: 500 });
+
+  const { error: rErr } = await sb.from("broadcast_recipients").insert(
+    unique.map((r) => ({
+      broadcastId: (broadcast as { id: string }).id,
+      phone: r.phone,
+      contactName: r.contactName,
+    })),
+  );
+
+  if (rErr) {
+    // Best-effort cleanup
+    await sb.from("broadcasts").delete().eq("id", (broadcast as { id: string }).id);
+    return NextResponse.json(fail(rErr.message), { status: 500 });
+  }
 
   return NextResponse.json(ok(broadcast), { status: 201 });
 }

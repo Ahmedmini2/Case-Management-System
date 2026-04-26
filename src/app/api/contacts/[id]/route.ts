@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const updateSchema = z.object({
   name: z.string().min(2).max(120).optional(),
@@ -17,36 +17,59 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const contact = await db.contact.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      phone: true,
-      company: true,
-      avatarUrl: true,
-      notes: true,
-      createdAt: true,
-      updatedAt: true,
-      cases: {
-        orderBy: { createdAt: "desc" },
-        take: 20,
-        select: {
-          id: true,
-          caseNumber: true,
-          title: true,
-          status: true,
-          priority: true,
-          createdAt: true,
-          assignedTo: { select: { id: true, name: true, email: true } },
-        },
-      },
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data: contact, error } = await sb
+    .from("contacts")
+    .select("id, name, email, phone, company, avatarUrl, notes, createdAt, updatedAt")
+    .eq("id", id)
+    .maybeSingle();
 
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
   if (!contact) return NextResponse.json(fail("Contact not found"), { status: 404 });
-  return NextResponse.json(ok(contact));
+
+  // Fetch recent cases
+  const { data: cases } = await sb
+    .from("cases")
+    .select("id, caseNumber, title, status, priority, createdAt, assignedToId")
+    .eq("contactId", id)
+    .order("createdAt", { ascending: false })
+    .limit(20);
+
+  type CaseRow = {
+    id: string;
+    caseNumber: string;
+    title: string;
+    status: string;
+    priority: string;
+    createdAt: string;
+    assignedToId: string | null;
+  };
+  const caseRows = ((cases as CaseRow[] | null) ?? []);
+
+  // Hydrate assignees
+  const userIds = [...new Set(caseRows.map((c) => c.assignedToId).filter(Boolean))] as string[];
+  const userMap = new Map<string, { id: string; name: string | null; email: string }>();
+  if (userIds.length > 0) {
+    const { data: users } = await sb
+      .from("users")
+      .select("id, name, email")
+      .in("id", userIds);
+    for (const u of (users ?? []) as { id: string; name: string | null; email: string }[]) {
+      userMap.set(u.id, u);
+    }
+  }
+
+  const enrichedCases = caseRows.map((c) => ({
+    id: c.id,
+    caseNumber: c.caseNumber,
+    title: c.title,
+    status: c.status,
+    priority: c.priority,
+    createdAt: c.createdAt,
+    assignedTo: c.assignedToId ? userMap.get(c.assignedToId) ?? null : null,
+  }));
+
+  return NextResponse.json(ok({ ...(contact as Record<string, unknown>), cases: enrichedCases }));
 }
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -57,16 +80,25 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   const parsed = updateSchema.safeParse(await request.json());
   if (!parsed.success) return NextResponse.json(fail("Invalid request body"), { status: 400 });
 
-  const contact = await db.contact.findUnique({ where: { id }, select: { id: true } });
-  if (!contact) return NextResponse.json(fail("Contact not found"), { status: 404 });
+  const sb = supabaseAdmin();
+  const { data: existing, error: findErr } = await sb
+    .from("contacts")
+    .select("id")
+    .eq("id", id)
+    .maybeSingle();
 
-  const updated = await db.contact.update({
-    where: { id },
-    data: parsed.data,
-    select: { id: true, name: true, email: true, phone: true, company: true, notes: true },
-  });
+  if (findErr) return NextResponse.json(fail(findErr.message), { status: 500 });
+  if (!existing) return NextResponse.json(fail("Contact not found"), { status: 404 });
 
-  return NextResponse.json(ok(updated));
+  const { data, error } = await sb
+    .from("contacts")
+    .update(parsed.data)
+    .eq("id", id)
+    .select("id, name, email, phone, company, notes")
+    .single();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data));
 }
 
 export async function DELETE(_: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -74,9 +106,17 @@ export async function DELETE(_: Request, { params }: { params: Promise<{ id: str
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const contact = await db.contact.findUnique({ where: { id }, select: { id: true } });
-  if (!contact) return NextResponse.json(fail("Contact not found"), { status: 404 });
+  const sb = supabaseAdmin();
+  const { data: existing, error: findErr } = await sb
+    .from("contacts")
+    .select("id")
+    .eq("id", id)
+    .maybeSingle();
 
-  await db.contact.delete({ where: { id } });
+  if (findErr) return NextResponse.json(fail(findErr.message), { status: 500 });
+  if (!existing) return NextResponse.json(fail("Contact not found"), { status: 404 });
+
+  const { error } = await sb.from("contacts").delete().eq("id", id);
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
   return NextResponse.json(ok({ id }));
 }

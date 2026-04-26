@@ -1,4 +1,4 @@
-import { Priority } from "@prisma/client";
+import { Priority } from "@/types/enums";
 import Link from "next/link";
 import { ArrowUpRight, CalendarDays, UserCircle2 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";

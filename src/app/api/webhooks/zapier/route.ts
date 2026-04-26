@@ -1,12 +1,12 @@
 import crypto from "node:crypto";
-import { ActivityType, CaseSource, CaseStatus, Priority } from "@prisma/client";
+import { ActivityType, CaseSource, CaseStatus, Priority } from "@/types/enums";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { verifyApiKey } from "@/lib/api-keys";
 import { writeAudit } from "@/lib/audit";
 import { generateCaseNumber } from "@/lib/case-number";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const zapierSchema = z.object({
   title: z.string().min(3).max(200),
@@ -50,86 +50,127 @@ export async function POST(request: Request) {
   if (!parsed.success) return NextResponse.json(fail("Invalid payload"), { status: 400 });
 
   const data = parsed.data;
+  const sb = supabaseAdmin();
 
-  const [assignee, defaultPipeline] = await Promise.all([
+  // Resolve assignee + default pipeline
+  const [assigneeRes, defaultPipelineRes] = await Promise.all([
     data.assigneeEmail
-      ? db.user.findUnique({
-          where: { email: data.assigneeEmail },
-          select: { id: true },
-        })
-      : Promise.resolve(null),
-    db.pipeline.findFirst({
-      where: { isDefault: true },
-      select: {
-        id: true,
-        stages: { orderBy: { position: "asc" }, take: 1, select: { id: true } },
-      },
-    }),
+      ? sb.from("users").select("id").eq("email", data.assigneeEmail).maybeSingle()
+      : Promise.resolve({ data: null }),
+    sb.from("pipelines").select("id").eq("isDefault", true).maybeSingle(),
   ]);
 
-  const fallbackOwner = await db.user.findFirst({ select: { id: true } });
+  const assignee = assigneeRes.data as { id: string } | null;
+  const defaultPipeline = defaultPipelineRes.data as { id: string } | null;
+
+  let firstStageId: string | null = null;
+  if (defaultPipeline) {
+    const { data: stage } = await sb
+      .from("pipeline_stages")
+      .select("id")
+      .eq("pipelineId", defaultPipeline.id)
+      .order("position", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    firstStageId = stage ? (stage as { id: string }).id : null;
+  }
+
+  const { data: fallbackOwnerRow } = await sb
+    .from("users")
+    .select("id")
+    .limit(1)
+    .maybeSingle();
+  const fallbackOwner = fallbackOwnerRow as { id: string } | null;
   if (!fallbackOwner) {
     return NextResponse.json(fail("No users exist to own the created case"), { status: 400 });
   }
 
-  const contact =
-    data.contactEmail
-      ? await db.contact.upsert({
-          where: { email: data.contactEmail },
-          update: { name: data.contactName ?? data.contactEmail },
-          create: { email: data.contactEmail, name: data.contactName ?? data.contactEmail },
-          select: { id: true },
-        })
-      : null;
+  // Upsert contact
+  let contactId: string | null = null;
+  if (data.contactEmail) {
+    const { data: existingContact } = await sb
+      .from("contacts")
+      .select("id")
+      .eq("email", data.contactEmail)
+      .maybeSingle();
+    if (existingContact) {
+      contactId = (existingContact as { id: string }).id;
+      await sb
+        .from("contacts")
+        .update({ name: data.contactName ?? data.contactEmail })
+        .eq("id", contactId);
+    } else {
+      const { data: newContact } = await sb
+        .from("contacts")
+        .insert({ email: data.contactEmail, name: data.contactName ?? data.contactEmail })
+        .select("id")
+        .single();
+      contactId = newContact ? (newContact as { id: string }).id : null;
+    }
+  }
 
-  const created = await db.$transaction(async (tx) => {
-    const caseItem = await tx.case.create({
-      data: {
-        caseNumber: await generateCaseNumber(),
-        title: data.title,
-        description: data.description,
-        priority: (data.priority as Priority | undefined) ?? Priority.MEDIUM,
-        status: CaseStatus.OPEN,
-        source: CaseSource.ZAPIER,
-        type: data.type,
-        customFields: data.customFields,
-        externalId: data.externalId,
-        createdById: fallbackOwner.id,
-        assignedToId: assignee?.id ?? null,
-        contactId: contact?.id ?? null,
-        pipelineId: defaultPipeline?.id ?? null,
-        pipelineStageId: defaultPipeline?.stages[0]?.id ?? null,
-      },
-      select: { id: true, caseNumber: true },
-    });
+  const caseNumber = await generateCaseNumber();
+  const { data: createdRow, error: createErr } = await sb
+    .from("cases")
+    .insert({
+      caseNumber,
+      title: data.title,
+      description: data.description,
+      priority: (data.priority as Priority | undefined) ?? Priority.MEDIUM,
+      status: CaseStatus.OPEN,
+      source: CaseSource.ZAPIER,
+      type: data.type,
+      customFields: data.customFields,
+      externalId: data.externalId,
+      createdById: fallbackOwner.id,
+      assignedToId: assignee?.id ?? null,
+      contactId,
+      pipelineId: defaultPipeline?.id ?? null,
+      pipelineStageId: firstStageId,
+    })
+    .select("id, caseNumber")
+    .single();
 
-    await tx.activity.create({
-      data: {
-        caseId: caseItem.id,
-        userId: fallbackOwner.id,
-        type: ActivityType.CREATED,
-        description: "Case created via Zapier webhook",
-      },
-    });
+  if (createErr || !createdRow) {
+    return NextResponse.json(fail(createErr?.message ?? "Failed to create case"), { status: 500 });
+  }
+  const created = createdRow as { id: string; caseNumber: string };
 
-    if (data.tags?.length) {
-      for (const tagName of data.tags) {
-        const tag = await tx.tag.upsert({
-          where: { name: tagName },
-          update: {},
-          create: { name: tagName },
-          select: { id: true },
-        });
-        await tx.caseTag.upsert({
-          where: { caseId_tagId: { caseId: caseItem.id, tagId: tag.id } },
-          update: {},
-          create: { caseId: caseItem.id, tagId: tag.id },
-        });
+  // Best-effort activity
+  await sb.from("activities").insert({
+    caseId: created.id,
+    userId: fallbackOwner.id,
+    type: ActivityType.CREATED,
+    description: "Case created via Zapier webhook",
+  });
+
+  // Tag upsert + linking
+  if (data.tags?.length) {
+    for (const tagName of data.tags) {
+      let tagId: string | null = null;
+      const { data: existingTag } = await sb
+        .from("tags")
+        .select("id")
+        .eq("name", tagName)
+        .maybeSingle();
+      if (existingTag) {
+        tagId = (existingTag as { id: string }).id;
+      } else {
+        const { data: newTag } = await sb
+          .from("tags")
+          .insert({ name: tagName })
+          .select("id")
+          .single();
+        tagId = newTag ? (newTag as { id: string }).id : null;
+      }
+
+      if (tagId) {
+        await sb
+          .from("case_tags")
+          .upsert({ caseId: created.id, tagId }, { onConflict: "caseId,tagId" });
       }
     }
-
-    return caseItem;
-  });
+  }
 
   await writeAudit({
     userId: fallbackOwner.id,

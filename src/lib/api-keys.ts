@@ -1,6 +1,6 @@
 import bcrypt from "bcryptjs";
 import { nanoid } from "nanoid";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export type ApiKeyScope = "read-only" | "write" | "admin";
 
@@ -20,23 +20,34 @@ export async function verifyApiKey(rawKey: string) {
   if (!rawKey.startsWith("cms_live_")) return null;
 
   const prefix = getApiKeyPrefix(rawKey);
-  const candidates = await db.apiKey.findMany({
-    where: {
-      prefix,
-      isActive: true,
-      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-    },
-    select: { id: true, keyHash: true, name: true },
-  });
+  const sb = supabaseAdmin();
+  const nowIso = new Date().toISOString();
+  const { data: candidatesRaw, error } = await sb
+    .from("api_keys")
+    .select("id, keyHash, name, expiresAt")
+    .eq("prefix", prefix)
+    .eq("isActive", true)
+    .or(`expiresAt.is.null,expiresAt.gt.${nowIso}`);
+  if (error) {
+    console.error("[api-keys] lookup failed:", error.message);
+    return null;
+  }
+
+  const candidates = (candidatesRaw ?? []) as {
+    id: string;
+    keyHash: string;
+    name: string;
+    expiresAt: string | null;
+  }[];
 
   for (const key of candidates) {
     const ok = await bcrypt.compare(rawKey, key.keyHash);
     if (ok) {
-      await db.apiKey.update({
-        where: { id: key.id },
-        data: { lastUsedAt: new Date() },
-      });
-      return key;
+      await sb
+        .from("api_keys")
+        .update({ lastUsedAt: nowIso })
+        .eq("id", key.id);
+      return { id: key.id, keyHash: key.keyHash, name: key.name };
     }
   }
 

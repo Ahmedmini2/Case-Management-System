@@ -1,8 +1,8 @@
-import { RunStatus } from "@prisma/client";
+import { RunStatus } from "@/types/enums";
 import { executeAutomationAction } from "@/lib/automations/actions";
 import { evaluateConditions } from "@/lib/automations/triggers";
 import type { AutomationAction, AutomationTrigger, AutomationTriggerType } from "@/lib/automations/types";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export async function runAutomationEngine(params: {
   triggerType: AutomationTriggerType;
@@ -10,25 +10,42 @@ export async function runAutomationEngine(params: {
   actorUserId?: string | null;
   payload?: Record<string, unknown>;
 }) {
-  const automations = await db.automation.findMany({
-    where: { isActive: true },
-    select: { id: true, trigger: true, actions: true },
-  });
+  const sb = supabaseAdmin();
 
-  const caseData = await db.case.findUnique({
-    where: { id: params.caseId },
-    select: {
-      id: true,
-      caseNumber: true,
-      title: true,
-      status: true,
-      priority: true,
-      assignedToId: true,
-      pipelineStageId: true,
-      dueDate: true,
-      slaBreachedAt: true,
-    },
-  });
+  const { data: automationsRaw } = await sb
+    .from("automations")
+    .select("id, trigger, actions, runCount")
+    .eq("isActive", true);
+
+  const automations = (automationsRaw ?? []) as {
+    id: string;
+    trigger: unknown;
+    actions: unknown;
+    runCount: number;
+  }[];
+
+  const { data: caseRow } = await sb
+    .from("cases")
+    .select(
+      "id, caseNumber, title, status, priority, assignedToId, pipelineStageId, dueDate, slaBreachedAt",
+    )
+    .eq("id", params.caseId)
+    .maybeSingle();
+
+  const caseData = caseRow as
+    | {
+        id: string;
+        caseNumber: string;
+        title: string;
+        status: string;
+        priority: string;
+        assignedToId: string | null;
+        pipelineStageId: string | null;
+        dueDate: string | null;
+        slaBreachedAt: string | null;
+      }
+    | null;
+
   if (!caseData) return { matched: 0, executed: 0 };
 
   let matched = 0;
@@ -43,14 +60,21 @@ export async function runAutomationEngine(params: {
     if (!conditionMatch) continue;
     matched += 1;
 
-    const run = await db.automationRun.create({
-      data: {
+    const { data: runRow, error: runErr } = await sb
+      .from("automation_runs")
+      .insert({
         automationId: automation.id,
         caseId: params.caseId,
         status: RunStatus.RUNNING,
-      },
-      select: { id: true },
-    });
+      })
+      .select("id")
+      .single();
+
+    if (runErr || !runRow) {
+      console.error("[automation] run create failed:", runErr?.message);
+      continue;
+    }
+    const runId = (runRow as { id: string }).id;
 
     try {
       const actions = automation.actions as unknown as AutomationAction[];
@@ -61,22 +85,28 @@ export async function runAutomationEngine(params: {
         });
       }
 
-      await db.automationRun.update({
-        where: { id: run.id },
-        data: { status: RunStatus.SUCCESS, result: { actions: actions.length } },
-      });
+      await sb
+        .from("automation_runs")
+        .update({ status: RunStatus.SUCCESS, result: { actions: actions.length } })
+        .eq("id", runId);
       executed += 1;
     } catch (error) {
-      await db.automationRun.update({
-        where: { id: run.id },
-        data: { status: RunStatus.FAILED, error: error instanceof Error ? error.message : "Unknown error" },
-      });
+      await sb
+        .from("automation_runs")
+        .update({
+          status: RunStatus.FAILED,
+          error: error instanceof Error ? error.message : "Unknown error",
+        })
+        .eq("id", runId);
     }
 
-    await db.automation.update({
-      where: { id: automation.id },
-      data: { runCount: { increment: 1 }, lastRunAt: new Date() },
-    });
+    await sb
+      .from("automations")
+      .update({
+        runCount: (automation.runCount ?? 0) + 1,
+        lastRunAt: new Date().toISOString(),
+      })
+      .eq("id", automation.id);
   }
 
   return { matched, executed };

@@ -23,6 +23,8 @@ import {
   Plus,
   Tag,
   Ban,
+  Smile,
+  Loader2,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -138,7 +140,108 @@ function MsgStatus({ status }: { status: string }) {
 /*  MEDIA PREVIEW                                                      */
 /* ------------------------------------------------------------------ */
 
-function MediaPreview({ mediaType }: { mediaType: string }) {
+const EMOJI_PRESET = [
+  "😀","😁","😂","🤣","😊","😍","😘","😎","🤩","😇",
+  "🙏","👍","👎","👏","🙌","🤝","💪","🤞","✌️","🫡",
+  "❤️","🧡","💛","💚","💙","💜","🖤","🤍","💕","💔",
+  "🔥","⭐","✨","🎉","🎊","🎁","💯","✅","❌","⚠️",
+  "🤔","😅","😢","😭","😡","😱","🥺","😴","🤯","🥳",
+  "📞","📱","💬","📧","📩","📌","📎","🛒","💰","🏷️",
+];
+
+function EmojiPicker({ onPick }: { onPick: (e: string) => void }) {
+  return (
+    <div
+      style={{
+        position: "absolute",
+        bottom: 48,
+        right: 0,
+        background: "#1a1a1a",
+        border: "1px solid #333",
+        borderRadius: 6,
+        padding: 8,
+        width: 264,
+        display: "grid",
+        gridTemplateColumns: "repeat(10, 1fr)",
+        gap: 2,
+        zIndex: 60,
+        boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+      }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      {EMOJI_PRESET.map((emoji) => (
+        <button
+          key={emoji}
+          type="button"
+          onClick={() => onPick(emoji)}
+          style={{
+            background: "transparent",
+            border: "none",
+            cursor: "pointer",
+            fontSize: 18,
+            padding: "4px 0",
+            borderRadius: 3,
+            transition: "background 0.1s",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "#2a2a2a")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
+          {emoji}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MediaPreview({ mediaType, mediaUrl }: { mediaType: string; mediaUrl?: string | null }) {
+  if (mediaUrl && mediaType === "image") {
+    return (
+      <a href={mediaUrl} target="_blank" rel="noopener noreferrer" style={{ display: "block", marginBottom: 6 }}>
+        <img
+          src={mediaUrl}
+          alt="Sent media"
+          style={{ maxWidth: 280, maxHeight: 280, borderRadius: 6, display: "block", objectFit: "cover" }}
+        />
+      </a>
+    );
+  }
+  if (mediaUrl && mediaType === "video") {
+    return (
+      <video
+        src={mediaUrl}
+        controls
+        style={{ maxWidth: 320, maxHeight: 280, borderRadius: 6, display: "block", marginBottom: 6 }}
+      />
+    );
+  }
+  if (mediaUrl && mediaType === "audio") {
+    return <audio src={mediaUrl} controls style={{ display: "block", marginBottom: 6 }} />;
+  }
+  if (mediaUrl) {
+    return (
+      <a
+        href={mediaUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "10px 14px",
+          background: "#ffffff08",
+          borderRadius: 3,
+          marginBottom: 6,
+          color: "#ddd",
+          textDecoration: "none",
+        }}
+      >
+        <FileText className="h-5 w-5" />
+        <span style={{ fontSize: 12, textTransform: "capitalize" }}>{mediaType || "Document"}</span>
+        <Download className="h-3.5 w-3.5 ml-auto" />
+      </a>
+    );
+  }
+  // No URL — fall back to icon-only chip
   const icons: Record<string, React.ReactNode> = {
     image: <Image className="h-5 w-5" />,
     video: <Video className="h-5 w-5" />,
@@ -149,7 +252,6 @@ function MediaPreview({ mediaType }: { mediaType: string }) {
     <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", background: "#ffffff08", borderRadius: 3, marginBottom: 6, color: "#888" }}>
       {icons[mediaType] ?? <FileText className="h-5 w-5" />}
       <span style={{ fontSize: 12, textTransform: "capitalize" }}>{mediaType}</span>
-      <Download className="h-3.5 w-3.5 ml-auto" />
     </div>
   );
 }
@@ -167,6 +269,67 @@ export default function WhatsAppPage() {
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [replyText, setReplyText] = useState("");
+  const [emojiOpen, setEmojiOpen] = useState(false);
+  const [attaching, setAttaching] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Template-send-to-conversation modal
+  type TemplateLite = {
+    id: string;
+    name: string;
+    language: string;
+    status: string;
+    body: string;
+    variableCount: number;
+  };
+  const [tplModalOpen, setTplModalOpen] = useState(false);
+  const [tplList, setTplList] = useState<TemplateLite[]>([]);
+  const [tplSelectedId, setTplSelectedId] = useState("");
+  const [tplVars, setTplVars] = useState<Record<string, string>>({});
+  const [tplSending, setTplSending] = useState(false);
+
+  const tplSelected = tplList.find((t) => t.id === tplSelectedId) ?? null;
+  let tplPreview = tplSelected?.body ?? "";
+  for (const [k, v] of Object.entries(tplVars)) {
+    tplPreview = tplPreview.replaceAll(`{{${k}}}`, v || `{{${k}}}`);
+  }
+
+  async function openTemplateModal() {
+    setTplModalOpen(true);
+    setTplSelectedId("");
+    setTplVars({});
+    try {
+      const res = await fetch("/api/whatsapp/templates");
+      const json = (await res.json()) as { data: TemplateLite[] | null };
+      setTplList((json.data ?? []).filter((t) => t.status === "APPROVED"));
+    } catch {
+      toast.error("Failed to load templates");
+    }
+  }
+
+  async function sendTemplate() {
+    if (!activeId || !tplSelectedId || tplSending) return;
+    setTplSending(true);
+    try {
+      const res = await fetch(`/api/whatsapp/conversations/${activeId}/messages/template`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ templateId: tplSelectedId, variables: tplVars }),
+      });
+      const json = (await res.json()) as { data: Message | null; error: string | null };
+      if (!res.ok || !json.data) {
+        toast.error(json.error ?? "Failed to send template");
+        return;
+      }
+      setMessages((prev) => [...prev, json.data as Message]);
+      toast.success("Template sent");
+      setTplModalOpen(false);
+    } catch {
+      toast.error("Failed to send template");
+    } finally {
+      setTplSending(false);
+    }
+  }
   const [takingOver, setTakingOver] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [assignDropdownOpen, setAssignDropdownOpen] = useState(false);
@@ -298,6 +461,31 @@ export default function WhatsAppPage() {
     setSending(false);
   }
 
+  /* ---- Send media attachment ---- */
+  async function handleAttach(file: File) {
+    if (!activeId || attaching) return;
+    setAttaching(true);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`/api/whatsapp/conversations/${activeId}/messages/media`, {
+        method: "POST",
+        body: form,
+      });
+      const json = (await res.json()) as { data: Message | null; error: string | null };
+      if (!res.ok || !json.data) {
+        toast.error(json.error ?? "Failed to send file");
+        return;
+      }
+      setMessages((prev) => [...prev, json.data as Message]);
+      toast.success(`Sent ${file.name}`);
+    } catch {
+      toast.error("Failed to send file");
+    } finally {
+      setAttaching(false);
+    }
+  }
+
   /* ---- Take over / hand back ---- */
   async function toggleHandoff() {
     if (!activeConv) return;
@@ -410,8 +598,8 @@ export default function WhatsAppPage() {
   async function addTag() {
     if (!activeConv || !tagInput.trim()) return;
     const tag = tagInput.trim().toLowerCase().replace(/\s+/g, "-");
-    if (activeConv.tags.includes(tag)) { toast.error("Tag already exists"); return; }
-    const newTags = [...activeConv.tags, tag];
+    if ((activeConv.tags ?? []).includes(tag)) { toast.error("Tag already exists"); return; }
+    const newTags = [...(activeConv.tags ?? []), tag];
     setDropdownOpen(false);
     setShowTagInput(false);
     setTagInput("");
@@ -426,7 +614,7 @@ export default function WhatsAppPage() {
 
   async function removeTag(tag: string) {
     if (!activeConv) return;
-    const newTags = activeConv.tags.filter((t) => t !== tag);
+    const newTags = (activeConv.tags ?? []).filter((t) => t !== tag);
     await fetch(`/api/whatsapp/conversations/${activeConv.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -646,12 +834,12 @@ export default function WhatsAppPage() {
                         </span>
                       )}
                     </div>
-                    {conv.tags.length > 0 && (
+                    {(conv.tags ?? []).length > 0 && (
                       <div style={{ display: "flex", gap: 3, marginTop: 3, flexWrap: "wrap" }}>
-                        {conv.tags.slice(0, 3).map((tag) => (
+                        {(conv.tags ?? []).slice(0, 3).map((tag) => (
                           <span key={tag} style={{ fontSize: 9, padding: "1px 5px", background: "#df564120", color: "#df5641", borderRadius: 2 }}>{tag}</span>
                         ))}
-                        {conv.tags.length > 3 && <span style={{ fontSize: 9, color: "#555" }}>+{conv.tags.length - 3}</span>}
+                        {(conv.tags ?? []).length > 3 && <span style={{ fontSize: 9, color: "#555" }}>+{(conv.tags ?? []).length - 3}</span>}
                       </div>
                     )}
                   </div>
@@ -791,9 +979,9 @@ export default function WhatsAppPage() {
                 </div>
 
                 {/* Tags inline next to assigned agent */}
-                {activeConv.tags.length > 0 && (
+                {(activeConv.tags ?? []).length > 0 && (
                   <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
-                    {activeConv.tags.map((tag) => (
+                    {(activeConv.tags ?? []).map((tag) => (
                       <span
                         key={tag}
                         style={{
@@ -926,6 +1114,7 @@ export default function WhatsAppPage() {
                     >
                       {/* Menu items */}
                       {[
+                        { label: "Send Template", icon: <FileText style={{ width: 13, height: 13 }} />, action: () => { setDropdownOpen(false); void openTemplateModal(); } },
                         { label: "Mark as Resolved", icon: <Check style={{ width: 13, height: 13 }} />, action: () => void markResolved() },
                         { label: "Add Tag", icon: <Tag style={{ width: 13, height: 13 }} />, action: () => setShowTagInput(true) },
                         { label: "Block Contact", icon: <Ban style={{ width: 13, height: 13 }} />, action: () => { setDropdownOpen(false); toast.info("Blocking coming soon"); } },
@@ -1063,7 +1252,9 @@ export default function WhatsAppPage() {
                                 : { background: "#1a1a1a", border: "1px solid #222", color: "#fff" }),
                             }}
                           >
-                            {msg.mediaType && <MediaPreview mediaType={msg.mediaType} />}
+                            {(msg.mediaType || msg.mediaUrl) && (
+                              <MediaPreview mediaType={msg.mediaType ?? "document"} mediaUrl={msg.mediaUrl} />
+                            )}
                             <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{msg.body}</div>
                             <div
                               style={{
@@ -1117,6 +1308,9 @@ export default function WhatsAppPage() {
                 }}
               >
                 <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={attaching}
                   style={{
                     width: 36,
                     height: 36,
@@ -1125,13 +1319,29 @@ export default function WhatsAppPage() {
                     justifyContent: "center",
                     background: "transparent",
                     border: "none",
-                    color: "#555",
-                    cursor: "pointer",
+                    color: attaching ? "#999" : "#555",
+                    cursor: attaching ? "wait" : "pointer",
                     flexShrink: 0,
                   }}
+                  aria-label="Attach file"
                 >
-                  <Paperclip style={{ width: 18, height: 18 }} />
+                  {attaching ? (
+                    <Loader2 style={{ width: 18, height: 18 }} className="animate-spin" />
+                  ) : (
+                    <Paperclip style={{ width: 18, height: 18 }} />
+                  )}
                 </button>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp,video/mp4,video/3gpp,audio/aac,audio/mp4,audio/mpeg,audio/amr,audio/ogg,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/csv"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void handleAttach(f);
+                    e.target.value = "";
+                  }}
+                />
                 <div style={{ flex: 1, position: "relative" }}>
                   <textarea
                     ref={textareaRef}
@@ -1175,6 +1385,35 @@ export default function WhatsAppPage() {
                     </span>
                   )}
                 </div>
+                <div style={{ position: "relative" }}>
+                  <button
+                    type="button"
+                    onClick={() => setEmojiOpen((v) => !v)}
+                    style={{
+                      width: 36,
+                      height: 36,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      background: "transparent",
+                      border: "none",
+                      color: emojiOpen ? "#fff" : "#555",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <Smile style={{ width: 18, height: 18 }} />
+                  </button>
+                  {emojiOpen && (
+                    <EmojiPicker
+                      onPick={(emoji) => {
+                        setReplyText((prev) => prev + emoji);
+                        setEmojiOpen(false);
+                        textareaRef.current?.focus();
+                      }}
+                    />
+                  )}
+                </div>
                 <button
                   onClick={() => void handleSend()}
                   disabled={!replyText.trim() || sending}
@@ -1200,6 +1439,232 @@ export default function WhatsAppPage() {
           </>
         )}
       </div>
+
+      {/* ---- Send template modal ---- */}
+      {tplModalOpen && (
+        <div
+          onClick={() => setTplModalOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.6)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 100,
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "100%",
+              maxWidth: 520,
+              maxHeight: "85vh",
+              background: "#0f0f0f",
+              border: "1px solid #2a2a2a",
+              borderRadius: 8,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                padding: "14px 18px",
+                borderBottom: "1px solid #1e1e1e",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <div>
+                <h3 style={{ fontSize: 14, fontWeight: 600, color: "#fff", margin: 0 }}>Send Template</h3>
+                <p style={{ fontSize: 11, color: "#666", margin: "2px 0 0" }}>
+                  to {activeConv?.contactName ?? activeConv?.contactPhone}
+                </p>
+              </div>
+              <button
+                onClick={() => setTplModalOpen(false)}
+                style={{
+                  width: 28,
+                  height: 28,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "transparent",
+                  border: "none",
+                  color: "#666",
+                  cursor: "pointer",
+                  borderRadius: 4,
+                }}
+                aria-label="Close"
+              >
+                <X style={{ width: 16, height: 16 }} />
+              </button>
+            </div>
+
+            <div style={{ padding: 18, overflowY: "auto", flex: 1 }}>
+              {/* Template list */}
+              <label style={{ fontSize: 11, color: "#888", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                Approved templates
+              </label>
+              {tplList.length === 0 ? (
+                <p style={{ fontSize: 12, color: "#666", marginTop: 8 }}>
+                  No approved templates available. Submit one in the Broadcast page.
+                </p>
+              ) : (
+                <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+                  {tplList.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => {
+                        setTplSelectedId(t.id);
+                        setTplVars({});
+                      }}
+                      style={{
+                        textAlign: "left",
+                        padding: "10px 12px",
+                        background: tplSelectedId === t.id ? "#1a1a1a" : "transparent",
+                        border: `1px solid ${tplSelectedId === t.id ? "#df5641" : "#2a2a2a"}`,
+                        borderRadius: 4,
+                        color: "#fff",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{t.name}</span>
+                        <span style={{ fontSize: 10, color: "#666" }}>{t.language}</span>
+                        {t.variableCount > 0 && (
+                          <span style={{ fontSize: 10, color: "#3b82f6" }}>
+                            {t.variableCount} variable{t.variableCount !== 1 ? "s" : ""}
+                          </span>
+                        )}
+                      </div>
+                      <p
+                        style={{
+                          fontSize: 11,
+                          color: "#888",
+                          margin: "4px 0 0",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          display: "-webkit-box",
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: "vertical",
+                        }}
+                      >
+                        {t.body}
+                      </p>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Variable inputs */}
+              {tplSelected && tplSelected.variableCount > 0 && (
+                <div style={{ marginTop: 16 }}>
+                  <label style={{ fontSize: 11, color: "#888", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                    Variables
+                  </label>
+                  <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 6 }}>
+                    {Array.from({ length: tplSelected.variableCount }, (_, i) => i + 1).map((n) => (
+                      <input
+                        key={n}
+                        value={tplVars[String(n)] ?? ""}
+                        onChange={(e) => setTplVars((prev) => ({ ...prev, [String(n)]: e.target.value }))}
+                        placeholder={`Value for {{${n}}}`}
+                        style={{
+                          padding: "8px 10px",
+                          background: "#0a0a0a",
+                          border: "1px solid #2a2a2a",
+                          borderRadius: 4,
+                          color: "#fff",
+                          fontSize: 12,
+                          outline: "none",
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Preview */}
+              {tplSelected && (
+                <div style={{ marginTop: 16 }}>
+                  <label style={{ fontSize: 11, color: "#888", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                    Preview
+                  </label>
+                  <div
+                    style={{
+                      marginTop: 6,
+                      padding: 12,
+                      background: "#1a1a1a",
+                      border: "1px solid #2a2a2a",
+                      borderRadius: 4,
+                      fontSize: 12,
+                      color: "#ddd",
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    {tplPreview}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div
+              style={{
+                padding: "12px 18px",
+                borderTop: "1px solid #1e1e1e",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: 8,
+              }}
+            >
+              <button
+                onClick={() => setTplModalOpen(false)}
+                style={{
+                  padding: "8px 14px",
+                  background: "transparent",
+                  border: "1px solid #333",
+                  borderRadius: 4,
+                  color: "#ccc",
+                  fontSize: 12,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void sendTemplate()}
+                disabled={!tplSelectedId || tplSending}
+                style={{
+                  padding: "8px 16px",
+                  background: tplSelectedId && !tplSending ? "#df5641" : "#333",
+                  border: "none",
+                  borderRadius: 4,
+                  color: "#fff",
+                  fontSize: 12,
+                  fontWeight: 600,
+                  cursor: tplSelectedId && !tplSending ? "pointer" : "not-allowed",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                {tplSending ? (
+                  <Loader2 style={{ width: 14, height: 14 }} className="animate-spin" />
+                ) : (
+                  <Send style={{ width: 14, height: 14 }} />
+                )}
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

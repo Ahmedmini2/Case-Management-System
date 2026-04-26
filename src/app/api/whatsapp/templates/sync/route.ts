@@ -1,9 +1,16 @@
 import { NextResponse } from "next/server";
 import { ok, fail } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const GRAPH_URL = "https://graph.facebook.com/v19.0";
+
+type MetaButton = {
+  type: string;
+  text: string;
+  url?: string;
+  phone_number?: string;
+};
 
 type MetaTemplate = {
   id: string;
@@ -15,6 +22,7 @@ type MetaTemplate = {
     type: string;
     text?: string;
     format?: string;
+    buttons?: MetaButton[];
   }[];
 };
 
@@ -54,6 +62,7 @@ export async function POST() {
     const metaData = (await metaRes.json()) as { data: MetaTemplate[] };
     const templates = metaData.data ?? [];
 
+    const sb = supabaseAdmin();
     let created = 0;
     let updated = 0;
 
@@ -61,45 +70,56 @@ export async function POST() {
       const bodyComp = t.components.find((c) => c.type === "BODY");
       const headerComp = t.components.find((c) => c.type === "HEADER");
       const footerComp = t.components.find((c) => c.type === "FOOTER");
+      const buttonsComp = t.components.find((c) => c.type === "BUTTONS");
       const body = bodyComp?.text ?? "";
 
       const varMatches = body.match(/\{\{\d+\}\}/g) ?? [];
       const variableCount = new Set(varMatches).size;
 
-      const existing = await db.whatsAppTemplate.findFirst({
-        where: { OR: [{ metaId: t.id }, { name: t.name }] },
-      });
+      const buttons = buttonsComp?.buttons
+        ? buttonsComp.buttons.map((b) => {
+            if (b.type === "URL") return { type: "URL", text: b.text, url: b.url ?? "" };
+            if (b.type === "PHONE_NUMBER") return { type: "PHONE_NUMBER", text: b.text, phone: b.phone_number ?? "" };
+            return { type: "QUICK_REPLY", text: b.text };
+          })
+        : null;
+
+      const { data: existing } = await sb
+        .from("whatsapp_templates")
+        .select("id")
+        .or(`metaId.eq.${t.id},name.eq.${t.name}`)
+        .limit(1)
+        .maybeSingle();
+
+      const payload = {
+        metaId: t.id,
+        name: t.name,
+        language: t.language,
+        category: t.category,
+        status: mapStatus(t.status),
+        body,
+        header: headerComp?.text ?? null,
+        footer: footerComp?.text ?? null,
+        buttons,
+        variableCount,
+      };
 
       if (existing) {
-        await db.whatsAppTemplate.update({
-          where: { id: existing.id },
-          data: {
-            metaId: t.id,
-            name: t.name,
-            language: t.language,
-            category: t.category,
-            status: mapStatus(t.status),
-            body,
-            header: headerComp?.text ?? null,
-            footer: footerComp?.text ?? null,
-            variableCount,
-          },
-        });
+        const { error: updErr } = await sb
+          .from("whatsapp_templates")
+          .update(payload)
+          .eq("id", (existing as { id: string }).id);
+        if (updErr) {
+          console.error("[WhatsApp Templates Sync] Update error:", updErr.message);
+          continue;
+        }
         updated++;
       } else {
-        await db.whatsAppTemplate.create({
-          data: {
-            metaId: t.id,
-            name: t.name,
-            language: t.language,
-            category: t.category,
-            status: mapStatus(t.status),
-            body,
-            header: headerComp?.text ?? null,
-            footer: footerComp?.text ?? null,
-            variableCount,
-          },
-        });
+        const { error: insErr } = await sb.from("whatsapp_templates").insert(payload);
+        if (insErr) {
+          console.error("[WhatsApp Templates Sync] Insert error:", insErr.message);
+          continue;
+        }
         created++;
       }
     }

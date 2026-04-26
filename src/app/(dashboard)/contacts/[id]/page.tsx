@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { CaseStatusBadge } from "@/components/cases/CaseStatusBadge";
@@ -17,34 +17,70 @@ import {
   UserCircle2,
 } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
+import type { CaseStatus, Priority } from "@/types/enums";
 
 async function getContact(id: string) {
-  return db.contact.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      phone: true,
-      company: true,
-      avatarUrl: true,
-      notes: true,
-      createdAt: true,
-      cases: {
-        orderBy: { createdAt: "desc" },
-        take: 20,
-        select: {
-          id: true,
-          caseNumber: true,
-          title: true,
-          status: true,
-          priority: true,
-          createdAt: true,
-          assignedTo: { select: { id: true, name: true, email: true } },
-        },
-      },
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data: contactRow } = await sb
+    .from("contacts")
+    .select("id, name, email, phone, company, avatarUrl, notes, createdAt")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (!contactRow) return null;
+
+  const contact = contactRow as {
+    id: string;
+    name: string;
+    email: string | null;
+    phone: string | null;
+    company: string | null;
+    avatarUrl: string | null;
+    notes: string | null;
+    createdAt: string;
+  };
+
+  const { data: casesRaw } = await sb
+    .from("cases")
+    .select("id, caseNumber, title, status, priority, createdAt, assignedToId")
+    .eq("contactId", id)
+    .order("createdAt", { ascending: false })
+    .limit(20);
+
+  const cases = (casesRaw ?? []) as {
+    id: string;
+    caseNumber: string;
+    title: string;
+    status: string;
+    priority: string;
+    createdAt: string;
+    assignedToId: string | null;
+  }[];
+
+  const assigneeIds = [...new Set(cases.map((c) => c.assignedToId).filter(Boolean) as string[])];
+  const assigneeMap = new Map<string, { id: string; name: string | null; email: string }>();
+  if (assigneeIds.length > 0) {
+    const { data: users } = await sb
+      .from("users")
+      .select("id, name, email")
+      .in("id", assigneeIds);
+    for (const u of (users ?? []) as { id: string; name: string | null; email: string }[]) {
+      assigneeMap.set(u.id, u);
+    }
+  }
+
+  return {
+    ...contact,
+    cases: cases.map((c) => ({
+      id: c.id,
+      caseNumber: c.caseNumber,
+      title: c.title,
+      status: c.status,
+      priority: c.priority,
+      createdAt: c.createdAt,
+      assignedTo: c.assignedToId ? assigneeMap.get(c.assignedToId) ?? null : null,
+    })),
+  };
 }
 
 export default async function ContactDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -119,7 +155,7 @@ export default async function ContactDetailPage({ params }: { params: Promise<{ 
                 )}
                 <div className="flex items-center gap-2 text-sm text-muted-foreground">
                   <Calendar className="h-4 w-4 shrink-0" />
-                  <span>Added {formatDistanceToNow(contact.createdAt, { addSuffix: true })}</span>
+                  <span>Added {formatDistanceToNow(new Date(contact.createdAt), { addSuffix: true })}</span>
                 </div>
               </div>
             </CardContent>
@@ -172,8 +208,8 @@ export default async function ContactDetailPage({ params }: { params: Promise<{ 
                           <span className="font-mono text-xs text-muted-foreground">
                             #{c.caseNumber}
                           </span>
-                          <CaseStatusBadge status={c.status} />
-                          <CasePriorityBadge priority={c.priority} />
+                          <CaseStatusBadge status={c.status as CaseStatus} />
+                          <CasePriorityBadge priority={c.priority as Priority} />
                         </div>
                         <p className="mt-0.5 truncate text-sm font-medium group-hover:text-primary transition-colors">
                           {c.title}
@@ -182,7 +218,7 @@ export default async function ContactDetailPage({ params }: { params: Promise<{ 
                           <UserCircle2 className="h-3 w-3" />
                           <span>{c.assignedTo?.name ?? c.assignedTo?.email ?? "Unassigned"}</span>
                           <span className="mx-1">·</span>
-                          <span>{formatDistanceToNow(c.createdAt, { addSuffix: true })}</span>
+                          <span>{formatDistanceToNow(new Date(c.createdAt), { addSuffix: true })}</span>
                         </div>
                       </div>
                     </Link>

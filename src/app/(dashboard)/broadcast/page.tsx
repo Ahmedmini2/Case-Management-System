@@ -13,6 +13,11 @@ import {
 /*  TYPES                                                              */
 /* ------------------------------------------------------------------ */
 
+type TemplateButton =
+  | { type: "QUICK_REPLY"; text: string }
+  | { type: "URL"; text: string; url: string }
+  | { type: "PHONE_NUMBER"; text: string; phone: string };
+
 interface Template {
   id: string;
   metaId: string | null;
@@ -23,6 +28,7 @@ interface Template {
   body: string;
   header: string | null;
   footer: string | null;
+  buttons: TemplateButton[] | null;
   variableCount: number;
   createdAt: string;
 }
@@ -126,6 +132,7 @@ export default function BroadcastPage() {
   const [tplBody, setTplBody] = useState("");
   const [tplHeader, setTplHeader] = useState("");
   const [tplFooter, setTplFooter] = useState("");
+  const [tplButtons, setTplButtons] = useState<TemplateButton[]>([]);
   const [tplCreating, setTplCreating] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [showTplForm, setShowTplForm] = useState(false);
@@ -206,16 +213,37 @@ export default function BroadcastPage() {
         body: JSON.stringify({
           name: tplName, category: tplCategory, language: tplLang,
           body: tplBody, header: tplHeader || null, footer: tplFooter || null,
+          buttons: tplButtons.length > 0 ? tplButtons : undefined,
         }),
       });
       const json = (await res.json()) as { error?: string };
       if (!res.ok) { toast.error(json.error ?? "Failed"); } else {
         toast.success("Template submitted to Meta for review");
-        setTplName(""); setTplBody(""); setTplHeader(""); setTplFooter(""); setShowTplForm(false);
+        setTplName(""); setTplBody(""); setTplHeader(""); setTplFooter(""); setTplButtons([]); setShowTplForm(false);
         await loadTemplates();
       }
     } catch { toast.error("Failed to create template"); }
     setTplCreating(false);
+  }
+
+  function addButton(type: TemplateButton["type"]) {
+    if (tplButtons.length >= 3) { toast.error("Max 3 buttons total"); return; }
+    const counts = { QUICK_REPLY: 0, URL: 0, PHONE_NUMBER: 0 };
+    for (const b of tplButtons) counts[b.type]++;
+    if (type === "QUICK_REPLY" && counts.QUICK_REPLY >= 3) { toast.error("Max 3 quick-reply buttons"); return; }
+    if (type === "URL" && counts.URL >= 2) { toast.error("Max 2 URL buttons"); return; }
+    if (type === "PHONE_NUMBER" && counts.PHONE_NUMBER >= 1) { toast.error("Max 1 phone button"); return; }
+    if (type === "URL") setTplButtons([...tplButtons, { type, text: "", url: "" }]);
+    else if (type === "PHONE_NUMBER") setTplButtons([...tplButtons, { type, text: "", phone: "" }]);
+    else setTplButtons([...tplButtons, { type, text: "" }]);
+  }
+
+  function updateButton(idx: number, patch: Partial<TemplateButton>) {
+    setTplButtons((prev) => prev.map((b, i) => (i === idx ? ({ ...b, ...patch } as TemplateButton) : b)));
+  }
+
+  function removeButton(idx: number) {
+    setTplButtons((prev) => prev.filter((_, i) => i !== idx));
   }
 
   async function deleteTemplate(id: string) {
@@ -459,6 +487,79 @@ export default function BroadcastPage() {
               <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Footer (optional)</label>
               <input value={tplFooter} onChange={(e) => setTplFooter(e.target.value)} placeholder="Reply STOP to unsubscribe" className="w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:border-primary" />
             </div>
+
+            {/* Buttons builder */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">Buttons (optional)</label>
+                <span className="text-[10px] text-muted-foreground">Max 3 quick-reply, 2 URL, 1 phone</span>
+              </div>
+              {tplButtons.length > 0 && (
+                <div className="space-y-2">
+                  {tplButtons.map((b, idx) => (
+                    <div key={idx} className="flex items-center gap-2 rounded-lg border bg-background p-2">
+                      <span className="shrink-0 rounded bg-muted px-2 py-1 text-[10px] font-medium text-muted-foreground">
+                        {b.type === "QUICK_REPLY" ? "Reply" : b.type === "URL" ? "URL" : "Phone"}
+                      </span>
+                      <input
+                        value={b.text}
+                        onChange={(e) => updateButton(idx, { text: e.target.value })}
+                        placeholder="Button text (e.g. Visit website)"
+                        maxLength={25}
+                        className="flex-1 rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:border-primary"
+                      />
+                      {b.type === "URL" && (
+                        <input
+                          value={(b as { url: string }).url}
+                          onChange={(e) => updateButton(idx, { url: e.target.value })}
+                          placeholder="https://example.com"
+                          className="flex-[2] rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:border-primary"
+                        />
+                      )}
+                      {b.type === "PHONE_NUMBER" && (
+                        <input
+                          value={(b as { phone: string }).phone}
+                          onChange={(e) => updateButton(idx, { phone: e.target.value })}
+                          placeholder="+15551234567"
+                          className="flex-[2] rounded-md border bg-background px-2 py-1.5 text-xs outline-none focus:border-primary"
+                        />
+                      )}
+                      <button
+                        onClick={() => removeButton(idx)}
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-red-500/10 hover:text-red-400"
+                        aria-label="Remove button"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => addButton("QUICK_REPLY")}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-dashed bg-background px-2.5 py-1 text-[11px] text-muted-foreground hover:border-primary hover:text-foreground"
+                >
+                  <Plus className="h-3 w-3" /> Quick Reply
+                </button>
+                <button
+                  type="button"
+                  onClick={() => addButton("URL")}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-dashed bg-background px-2.5 py-1 text-[11px] text-muted-foreground hover:border-primary hover:text-foreground"
+                >
+                  <Plus className="h-3 w-3" /> URL
+                </button>
+                <button
+                  type="button"
+                  onClick={() => addButton("PHONE_NUMBER")}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-dashed bg-background px-2.5 py-1 text-[11px] text-muted-foreground hover:border-primary hover:text-foreground"
+                >
+                  <Plus className="h-3 w-3" /> Phone
+                </button>
+              </div>
+            </div>
+
             <div className="flex items-center gap-2 pt-1">
               <button onClick={() => void createTemplate()} disabled={tplCreating} className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/80 disabled:opacity-50">
                 {tplCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />} Submit for Review
@@ -491,6 +592,18 @@ export default function BroadcastPage() {
                   </div>
                   <p className="text-xs text-muted-foreground truncate">{t.body}</p>
                   {t.variableCount > 0 && <p className="text-[10px] text-blue-400 mt-0.5">{t.variableCount} variable{t.variableCount !== 1 ? "s" : ""}</p>}
+                  {t.buttons && t.buttons.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {t.buttons.map((b, i) => (
+                        <span
+                          key={i}
+                          className="inline-flex items-center gap-1 rounded border bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                        >
+                          {b.type === "QUICK_REPLY" ? "↩" : b.type === "URL" ? "🔗" : "📞"} {b.text}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <button onClick={() => void deleteTemplate(t.id)} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:text-red-400 hover:bg-red-500/10">
                   <Trash2 className="h-4 w-4" />

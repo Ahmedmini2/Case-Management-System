@@ -1,6 +1,6 @@
 "use client";
 
-import { Priority } from "@prisma/client";
+import { Priority } from "@/types/enums";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";

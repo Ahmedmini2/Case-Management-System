@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const createSchema = z.object({
   caseId: z.string().optional(),
@@ -19,13 +19,21 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const unreadOnly = searchParams.get("unreadOnly") === "true";
 
-  const rows = await db.notification.findMany({
-    where: { userId: session.user.id, ...(unreadOnly ? { isRead: false } : {}) },
-    orderBy: { createdAt: "desc" },
-    take: 50,
-    select: { id: true, type: true, title: true, body: true, isRead: true, link: true, createdAt: true },
-  });
-  return NextResponse.json(ok(rows, { total: rows.length }));
+  const sb = supabaseAdmin();
+  let query = sb
+    .from("notifications")
+    .select("id, type, title, body, isRead, link, createdAt")
+    .eq("userId", session.user.id)
+    .order("createdAt", { ascending: false })
+    .limit(50);
+
+  if (unreadOnly) query = query.eq("isRead", false);
+
+  const { data, error } = await query;
+  if (error) {
+    return NextResponse.json(fail(error.message), { status: 500 });
+  }
+  return NextResponse.json(ok(data ?? [], { total: (data ?? []).length }));
 }
 
 export async function POST(request: Request) {
@@ -34,9 +42,13 @@ export async function POST(request: Request) {
   const parsed = createSchema.safeParse(await request.json());
   if (!parsed.success) return NextResponse.json(fail("Invalid request body"), { status: 400 });
 
-  const created = await db.notification.create({
-    data: { ...parsed.data, userId: session.user.id },
-    select: { id: true, title: true, isRead: true, createdAt: true },
-  });
-  return NextResponse.json(ok(created), { status: 201 });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("notifications")
+    .insert({ ...parsed.data, userId: session.user.id })
+    .select("id, title, isRead, createdAt")
+    .single();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data), { status: 201 });
 }

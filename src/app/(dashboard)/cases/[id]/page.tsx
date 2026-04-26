@@ -2,54 +2,138 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { CaseDetail } from "@/components/cases/CaseDetail";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { ArrowLeft, Printer } from "lucide-react";
+import type { CaseStatus, Priority } from "@/types/enums";
 
 async function getCaseData(id: string) {
-  return db.case.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      caseNumber: true,
-      title: true,
-      description: true,
-      status: true,
-      priority: true,
-      dueDate: true,
-      slaBreachedAt: true,
-      resolvedAt: true,
-      closedAt: true,
-      assignedTo: { select: { id: true, name: true, email: true, image: true } },
-      comments: {
-        orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          body: true,
-          isInternal: true,
-          createdAt: true,
-          author: { select: { id: true, name: true, email: true } },
-        },
-      },
-      activities: {
-        orderBy: { createdAt: "desc" },
-        take: 50,
-        select: {
-          id: true,
-          type: true,
-          description: true,
-          createdAt: true,
-          user: { select: { id: true, name: true } },
-        },
-      },
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data: caseRow } = await sb
+    .from("cases")
+    .select(
+      "id, caseNumber, title, description, status, priority, dueDate, slaBreachedAt, resolvedAt, closedAt, assignedToId",
+    )
+    .eq("id", id)
+    .maybeSingle();
+
+  if (!caseRow) return null;
+
+  const c = caseRow as {
+    id: string;
+    caseNumber: string;
+    title: string;
+    description: string | null;
+    status: string;
+    priority: string;
+    dueDate: string | null;
+    slaBreachedAt: string | null;
+    resolvedAt: string | null;
+    closedAt: string | null;
+    assignedToId: string | null;
+  };
+
+  let assignedTo: { id: string; name: string | null; email: string; image: string | null } | null = null;
+  if (c.assignedToId) {
+    const { data: u } = await sb
+      .from("users")
+      .select("id, name, email, image")
+      .eq("id", c.assignedToId)
+      .maybeSingle();
+    assignedTo = (u as typeof assignedTo) ?? null;
+  }
+
+  const { data: commentsRaw } = await sb
+    .from("comments")
+    .select("id, body, isInternal, createdAt, authorId")
+    .eq("caseId", id)
+    .order("createdAt", { ascending: false });
+
+  const { data: activitiesRaw } = await sb
+    .from("activities")
+    .select("id, type, description, createdAt, userId")
+    .eq("caseId", id)
+    .order("createdAt", { ascending: false })
+    .limit(50);
+
+  const comments = (commentsRaw ?? []) as {
+    id: string;
+    body: string;
+    isInternal: boolean;
+    createdAt: string;
+    authorId: string | null;
+  }[];
+  const activities = (activitiesRaw ?? []) as {
+    id: string;
+    type: string;
+    description: string | null;
+    createdAt: string;
+    userId: string | null;
+  }[];
+
+  const userIds = [
+    ...new Set([
+      ...comments.map((cm) => cm.authorId).filter(Boolean) as string[],
+      ...activities.map((a) => a.userId).filter(Boolean) as string[],
+    ]),
+  ];
+  const userMap = new Map<string, { id: string; name: string | null; email: string }>();
+  if (userIds.length > 0) {
+    const { data: users } = await sb
+      .from("users")
+      .select("id, name, email")
+      .in("id", userIds);
+    for (const u of (users ?? []) as { id: string; name: string | null; email: string }[]) {
+      userMap.set(u.id, u);
+    }
+  }
+
+  return {
+    id: c.id,
+    caseNumber: c.caseNumber,
+    title: c.title,
+    description: c.description,
+    status: c.status as CaseStatus,
+    priority: c.priority as Priority,
+    dueDate: c.dueDate,
+    slaBreachedAt: c.slaBreachedAt,
+    resolvedAt: c.resolvedAt,
+    closedAt: c.closedAt,
+    assignedTo,
+    comments: comments.map((cm) => ({
+      id: cm.id,
+      body: cm.body,
+      isInternal: cm.isInternal,
+      createdAt: cm.createdAt,
+      author: cm.authorId ? userMap.get(cm.authorId) ?? null : null,
+    })),
+    activities: activities.map((a) => ({
+      id: a.id,
+      type: a.type,
+      description: a.description ?? "",
+      createdAt: a.createdAt,
+      user: a.userId
+        ? (() => {
+            const u = userMap.get(a.userId);
+            return u ? { id: u.id, name: u.name } : null;
+          })()
+        : null,
+    })),
+  };
 }
 
 async function getUsers() {
-  return db.user.findMany({
-    select: { id: true, name: true, email: true, image: true, role: true },
-    orderBy: { name: "asc" },
-  });
+  const sb = supabaseAdmin();
+  const { data } = await sb
+    .from("users")
+    .select("id, name, email, image, role")
+    .order("name", { ascending: true });
+  return ((data ?? []) as {
+    id: string;
+    name: string | null;
+    email: string;
+    image: string | null;
+    role: string;
+  }[]);
 }
 
 export default async function CaseDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -65,21 +149,7 @@ export default async function CaseDetailPage({ params }: { params: Promise<{ id:
 
   if (!caseData) notFound();
 
-  const initialData = {
-    ...caseData,
-    dueDate: caseData.dueDate?.toISOString() ?? null,
-    slaBreachedAt: caseData.slaBreachedAt?.toISOString() ?? null,
-    resolvedAt: caseData.resolvedAt?.toISOString() ?? null,
-    closedAt: caseData.closedAt?.toISOString() ?? null,
-    comments: caseData.comments.map((c) => ({
-      ...c,
-      createdAt: c.createdAt.toISOString(),
-    })),
-    activities: caseData.activities.map((a) => ({
-      ...a,
-      createdAt: a.createdAt.toISOString(),
-    })),
-  };
+  const initialData = caseData;
 
   const initialUsers = users.map((u) => ({
     id: u.id,
@@ -104,7 +174,7 @@ export default async function CaseDetailPage({ params }: { params: Promise<{ id:
       <CaseDetail
         caseId={id}
         currentUserId={session.user.id}
-        initialData={initialData}
+        initialData={initialData as unknown as Parameters<typeof CaseDetail>[0]["initialData"]}
         initialUsers={initialUsers}
       />
     </div>

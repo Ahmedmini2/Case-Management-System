@@ -1,7 +1,7 @@
-import { EmailStatus, EmailDir } from "@prisma/client";
+import { EmailStatus, EmailDir } from "@/types/enums";
 import { sendCaseEmail } from "@/lib/email/sender";
 import { emailQueue } from "@/lib/queue/client";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export type EmailJobPayload = {
   emailId: string;
@@ -18,15 +18,18 @@ export type EmailJobPayload = {
 
 export async function processEmailJob(payload: EmailJobPayload) {
   const result = await sendCaseEmail(payload);
-  await db.email.update({
-    where: { id: payload.emailId },
-    data: {
+  const sb = supabaseAdmin();
+  const sentId =
+    result && "data" in result && result.data?.id ? result.data.id : null;
+  await sb
+    .from("emails")
+    .update({
       direction: EmailDir.OUTBOUND,
-      status: result && "data" in result && result.data?.id ? EmailStatus.SENT : EmailStatus.PENDING,
-      resendId: result && "data" in result ? result.data?.id ?? null : null,
-      sentAt: new Date(),
-    },
-  });
+      status: sentId ? EmailStatus.SENT : EmailStatus.PENDING,
+      resendId: sentId,
+      sentAt: new Date().toISOString(),
+    })
+    .eq("id", payload.emailId);
 }
 
 export async function enqueueEmailJob(payload: EmailJobPayload) {

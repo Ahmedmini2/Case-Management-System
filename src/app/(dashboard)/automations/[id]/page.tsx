@@ -1,16 +1,41 @@
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export default async function AutomationDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const session = await auth();
   if (!session?.user?.id) return null;
 
-  const item = await db.automation.findUnique({
-    where: { id },
-    include: { runs: { orderBy: { createdAt: "desc" }, take: 20 } },
-  });
-  if (!item) return <p className="text-sm text-muted-foreground">Automation not found.</p>;
+  const sb = supabaseAdmin();
+  const { data: itemRow } = await sb
+    .from("automations")
+    .select("id, name, description, trigger, actions")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (!itemRow) return <p className="text-sm text-muted-foreground">Automation not found.</p>;
+
+  const item = itemRow as {
+    id: string;
+    name: string;
+    description: string | null;
+    trigger: unknown;
+    actions: unknown;
+  };
+
+  const { data: runsRaw } = await sb
+    .from("automation_runs")
+    .select("id, status, error, createdAt")
+    .eq("automationId", id)
+    .order("createdAt", { ascending: false })
+    .limit(20);
+
+  const runs = (runsRaw ?? []) as {
+    id: string;
+    status: string;
+    error: string | null;
+    createdAt: string;
+  }[];
 
   return (
     <div className="space-y-4">
@@ -20,7 +45,7 @@ export default async function AutomationDetailPage({ params }: { params: Promise
       <pre className="overflow-auto rounded-md border p-3 text-xs">{JSON.stringify(item.actions, null, 2)}</pre>
       <div className="space-y-2">
         <h2 className="font-medium">Recent Runs</h2>
-        {item.runs.map((run) => (
+        {runs.map((run) => (
           <div key={run.id} className="rounded-md border p-3 text-sm">
             <p>
               {run.status} - {new Date(run.createdAt).toLocaleString()}

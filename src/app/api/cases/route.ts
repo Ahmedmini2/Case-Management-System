@@ -1,15 +1,44 @@
-import { ActivityType, CaseSource, CaseStatus, Priority } from "@prisma/client";
+import { CaseSource, CaseStatus, Priority } from "@/types/enums";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
+import { verifyApiKey } from "@/lib/api-keys";
 import { runAutomationEngine } from "@/lib/automations/engine";
 import { auth } from "@/lib/auth";
 import { writeAudit } from "@/lib/audit";
 import { generateCaseNumber } from "@/lib/case-number";
 import { enqueueEmailJob } from "@/lib/queue/jobs";
 import { triggerPusherEvent } from "@/lib/pusher";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { calculateSlaDueDate, enqueueSlaWarning } from "@/lib/sla";
+
+// Resolve identity from either a NextAuth session (browser) or an API key Bearer token (n8n/Zapier).
+// Returns the userId to record on the case, plus an optional email for outbound notification.
+async function resolveCaller(request: Request): Promise<
+  { userId: string; email: string | null } | null
+> {
+  const session = await auth();
+  if (session?.user?.id) {
+    return { userId: session.user.id, email: session.user.email ?? null };
+  }
+  const authHeader = request.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) return null;
+  const token = authHeader.slice("Bearer ".length).trim();
+  const key = await verifyApiKey(token);
+  if (!key) return null;
+  // For API-key-authored cases, record them under the first SUPER_ADMIN as the system author.
+  const sb = supabaseAdmin();
+  const { data: owner } = await sb
+    .from("users")
+    .select("id, email")
+    .or("role.eq.SUPER_ADMIN,role.eq.ADMIN")
+    .order("createdAt", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const o = owner as { id: string; email: string } | null;
+  if (!o) return null;
+  return { userId: o.id, email: o.email };
+}
 
 const createCaseSchema = z.object({
   title: z.string().min(3).max(200),
@@ -35,57 +64,117 @@ export async function GET(request: Request) {
   const take = Math.min(Number(searchParams.get("take") ?? "20"), 50);
   const cursor = searchParams.get("cursor");
   const q = searchParams.get("q");
-  const status = searchParams.get("status") as CaseStatus | null;
-  const priority = searchParams.get("priority") as Priority | null;
+  const status = searchParams.get("status");
+  const priority = searchParams.get("priority");
 
-  const where = {
-    ...(q
-      ? {
-          OR: [
-            { title: { contains: q, mode: "insensitive" as const } },
-            { caseNumber: { contains: q, mode: "insensitive" as const } },
-          ],
-        }
-      : {}),
-    ...(status ? { status } : {}),
-    ...(priority ? { priority } : {}),
+  const sb = supabaseAdmin();
+
+  // Build the cases query
+  let query = sb
+    .from("cases")
+    .select("id, caseNumber, title, status, priority, source, createdAt, dueDate, assignedToId", {
+      count: "exact",
+    })
+    .order("createdAt", { ascending: false })
+    .limit(take + 1);
+
+  if (q) {
+    query = query.or(`title.ilike.%${q}%,caseNumber.ilike.%${q}%`);
+  }
+  if (status) query = query.eq("status", status);
+  if (priority) query = query.eq("priority", priority);
+
+  // Cursor-based pagination: fetch the cursor row's createdAt then filter
+  if (cursor) {
+    const { data: cursorRow } = await sb
+      .from("cases")
+      .select("createdAt")
+      .eq("id", cursor)
+      .maybeSingle();
+    if (cursorRow) {
+      const ts = (cursorRow as { createdAt: string }).createdAt;
+      query = query.lt("createdAt", ts);
+    }
+  }
+
+  const { data: rows, error, count } = await query;
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  type Row = {
+    id: string;
+    caseNumber: string;
+    title: string;
+    status: string;
+    priority: string;
+    source: string;
+    createdAt: string;
+    dueDate: string | null;
+    assignedToId: string | null;
   };
-
-  const [items, total] = await Promise.all([
-    db.case.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      take: take + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      select: {
-        id: true,
-        caseNumber: true,
-        title: true,
-        status: true,
-        priority: true,
-        source: true,
-        createdAt: true,
-        dueDate: true,
-        assignedTo: {
-          select: { id: true, name: true, email: true },
-        },
-        tags: {
-          select: {
-            tag: { select: { id: true, name: true, color: true } },
-          },
-        },
-      },
-    }),
-    db.case.count({ where }),
-  ]);
-
+  const items = (rows ?? []) as Row[];
   const hasMore = items.length > take;
-  const data = hasMore ? items.slice(0, take) : items;
-  const nextCursor = hasMore ? data[data.length - 1]?.id ?? null : null;
+  const sliced = hasMore ? items.slice(0, take) : items;
+  const nextCursor = hasMore ? sliced[sliced.length - 1]?.id ?? null : null;
+
+  // Hydrate assignees
+  const assigneeIds = [...new Set(sliced.map((c) => c.assignedToId).filter(Boolean))] as string[];
+  const assigneeMap = new Map<string, { id: string; name: string | null; email: string }>();
+  if (assigneeIds.length > 0) {
+    const { data: users } = await sb
+      .from("users")
+      .select("id, name, email")
+      .in("id", assigneeIds);
+    for (const u of (users ?? []) as { id: string; name: string | null; email: string }[]) {
+      assigneeMap.set(u.id, u);
+    }
+  }
+
+  // Hydrate tags via case_tags + tags
+  const caseIds = sliced.map((c) => c.id);
+  const tagsByCaseId = new Map<string, { id: string; name: string; color: string }[]>();
+  if (caseIds.length > 0) {
+    const { data: caseTags } = await sb
+      .from("case_tags")
+      .select("caseId, tagId")
+      .in("caseId", caseIds);
+    const tagIds = [
+      ...new Set(((caseTags ?? []) as { caseId: string; tagId: string }[]).map((t) => t.tagId)),
+    ];
+    const tagMap = new Map<string, { id: string; name: string; color: string }>();
+    if (tagIds.length > 0) {
+      const { data: tagsData } = await sb
+        .from("tags")
+        .select("id, name, color")
+        .in("id", tagIds);
+      for (const t of (tagsData ?? []) as { id: string; name: string; color: string }[]) {
+        tagMap.set(t.id, t);
+      }
+    }
+    for (const ct of (caseTags ?? []) as { caseId: string; tagId: string }[]) {
+      const tag = tagMap.get(ct.tagId);
+      if (!tag) continue;
+      const list = tagsByCaseId.get(ct.caseId) ?? [];
+      list.push(tag);
+      tagsByCaseId.set(ct.caseId, list);
+    }
+  }
+
+  const data = sliced.map((c) => ({
+    id: c.id,
+    caseNumber: c.caseNumber,
+    title: c.title,
+    status: c.status,
+    priority: c.priority,
+    source: c.source,
+    createdAt: c.createdAt,
+    dueDate: c.dueDate,
+    assignedTo: c.assignedToId ? assigneeMap.get(c.assignedToId) ?? null : null,
+    tags: (tagsByCaseId.get(c.id) ?? []).map((t) => ({ tag: t })),
+  }));
 
   return NextResponse.json(
     ok(data, {
-      total,
+      total: count ?? data.length,
       take,
       hasMore,
       nextCursor,
@@ -94,8 +183,8 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  const session = await auth();
-  if (!session?.user?.id) {
+  const caller = await resolveCaller(request);
+  if (!caller) {
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
@@ -106,121 +195,149 @@ export async function POST(request: Request) {
       return NextResponse.json(fail("Invalid request body"), { status: 400 });
     }
 
-    const defaultPipeline = parsed.data.pipelineId
-      ? await db.pipeline.findUnique({
-          where: { id: parsed.data.pipelineId },
-          select: { id: true },
-        })
-      : await db.pipeline.findFirst({
-          where: { isDefault: true },
-          select: {
-            id: true,
-            stages: { orderBy: { position: "asc" }, take: 1, select: { id: true } },
-          },
-        });
+    const sb = supabaseAdmin();
 
-    const stageId =
-      parsed.data.pipelineStageId ?? ("stages" in (defaultPipeline ?? {}) ? defaultPipeline?.stages[0]?.id : null);
+    // Resolve pipeline + first stage
+    let pipelineId: string | null = parsed.data.pipelineId ?? null;
+    let stageId: string | null = parsed.data.pipelineStageId ?? null;
 
-    const created = await db.$transaction(async (tx) => {
-      const caseNumber = await generateCaseNumber();
-      const dueDate = await calculateSlaDueDate(parsed.data.priority);
-      const newCase = await tx.case.create({
-        data: {
-          caseNumber,
-          title: parsed.data.title,
-          description: parsed.data.description,
-          priority: parsed.data.priority,
-          status: parsed.data.status,
-          type: parsed.data.type,
-          assignedToId: parsed.data.assignedToId,
-          teamId: parsed.data.teamId,
-          contactId: parsed.data.contactId,
-          source: parsed.data.source,
-          createdById: session.user.id,
-          pipelineId: parsed.data.pipelineId ?? defaultPipeline?.id ?? null,
-          pipelineStageId: stageId ?? null,
-          dueDate,
-        },
-        select: {
-          id: true,
-          caseNumber: true,
-          title: true,
-          status: true,
-          priority: true,
-          createdAt: true,
-        },
-      });
+    if (!stageId) {
+      if (pipelineId) {
+        // Just verify pipeline exists; no auto-stage selection
+        const { data: pipe } = await sb
+          .from("pipelines")
+          .select("id")
+          .eq("id", pipelineId)
+          .maybeSingle();
+        if (!pipe) pipelineId = null;
+      } else {
+        const { data: defaultPipe } = await sb
+          .from("pipelines")
+          .select("id")
+          .eq("isDefault", true)
+          .maybeSingle();
+        if (defaultPipe) {
+          pipelineId = (defaultPipe as { id: string }).id;
+          const { data: firstStage } = await sb
+            .from("pipeline_stages")
+            .select("id")
+            .eq("pipelineId", pipelineId)
+            .order("position", { ascending: true })
+            .limit(1)
+            .maybeSingle();
+          stageId = firstStage ? (firstStage as { id: string }).id : null;
+        }
+      }
+    }
 
-      await tx.activity.create({
-        data: {
-          caseId: newCase.id,
-          userId: session.user.id,
-          type: ActivityType.CREATED,
-          description: "Case created",
-        },
-      });
+    const caseNumber = await generateCaseNumber();
+    const dueDate = await calculateSlaDueDate(parsed.data.priority);
 
-      return newCase;
+    const { data: created, error: createErr } = await sb
+      .from("cases")
+      .insert({
+        caseNumber,
+        title: parsed.data.title,
+        description: parsed.data.description,
+        priority: parsed.data.priority,
+        status: parsed.data.status,
+        type: parsed.data.type,
+        assignedToId: parsed.data.assignedToId ?? null,
+        teamId: parsed.data.teamId ?? null,
+        contactId: parsed.data.contactId ?? null,
+        source: parsed.data.source,
+        createdById: caller.userId,
+        pipelineId,
+        pipelineStageId: stageId,
+        dueDate: dueDate ? new Date(dueDate).toISOString() : null,
+      })
+      .select("id, caseNumber, title, status, priority, createdAt")
+      .single();
+
+    if (createErr || !created) {
+      return NextResponse.json(fail(createErr?.message ?? "Failed to create case"), { status: 500 });
+    }
+
+    const newCase = created as {
+      id: string;
+      caseNumber: string;
+      title: string;
+      status: string;
+      priority: string;
+      createdAt: string;
+    };
+
+    // Best-effort activity record
+    const { error: actErr } = await sb.from("activities").insert({
+      caseId: newCase.id,
+      userId: caller.userId,
+      type: "CREATED",
+      description: "Case created",
     });
+    if (actErr) console.error("[POST /api/cases] best-effort activity failed:", actErr.message);
 
     await writeAudit({
-      userId: session.user.id,
-      caseId: created.id,
+      userId: caller.userId,
+      caseId: newCase.id,
       action: "CASE_CREATED",
       resource: "case",
-      resourceId: created.id,
-      after: created,
+      resourceId: newCase.id,
+      after: newCase,
       req: request,
     });
 
     await triggerPusherEvent("cases", "case:created", {
-      id: created.id,
-      caseNumber: created.caseNumber,
-      title: created.title,
+      id: newCase.id,
+      caseNumber: newCase.caseNumber,
+      title: newCase.title,
     });
 
     // Fire-and-forget: SLA, automations, email — don't block the response
     Promise.all([
-      enqueueSlaWarning(created.id).catch((e) => console.error("[POST /api/cases] SLA warning error:", e)),
+      enqueueSlaWarning(newCase.id).catch((e) => console.error("[POST /api/cases] SLA warning error:", e)),
       runAutomationEngine({
         triggerType: "CASE_CREATED",
-        caseId: created.id,
-        actorUserId: session.user.id,
+        caseId: newCase.id,
+        actorUserId: caller.userId,
       }).catch((e) => console.error("[POST /api/cases] Automation error:", e)),
       (async () => {
-        if (!session.user.email) return;
-        const emailRecord = await db.email.create({
-          data: {
-            caseId: created.id,
-            subject: `Case created: ${created.caseNumber}`,
+        if (!caller.email) return;
+        const { data: emailRecord, error: emErr } = await sb
+          .from("emails")
+          .insert({
+            caseId: newCase.id,
+            subject: `Case created: ${newCase.caseNumber}`,
             body: "A new case has been created.",
             bodyText: "A new case has been created.",
             direction: "OUTBOUND",
             from: process.env.EMAIL_FROM ?? "support@example.com",
-            to: [session.user.email],
+            to: [caller.email],
             cc: [],
             bcc: [],
             status: "PENDING",
-          },
-          select: { id: true },
-        });
+          })
+          .select("id")
+          .single();
+        if (emErr || !emailRecord) {
+          console.error("[POST /api/cases] email row create failed:", emErr?.message);
+          return;
+        }
         await enqueueEmailJob({
-          emailId: emailRecord.id,
-          to: [session.user.email],
-          subject: `Case created: ${created.caseNumber}`,
-          caseNumber: created.caseNumber,
-          caseTitle: created.title,
-          status: created.status,
-          priority: created.priority,
+          emailId: (emailRecord as { id: string }).id,
+          to: [caller.email],
+          subject: `Case created: ${newCase.caseNumber}`,
+          caseNumber: newCase.caseNumber,
+          caseTitle: newCase.title,
+          status: newCase.status,
+          priority: newCase.priority,
           assignee: null,
           updateMessage: "Your case has been created successfully.",
-          caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${created.id}`,
+          caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${newCase.id}`,
         });
       })().catch((e) => console.error("[POST /api/cases] Email error:", e)),
     ]).catch(() => {});
 
-    return NextResponse.json(ok(created), { status: 201 });
+    return NextResponse.json(ok(newCase), { status: 201 });
   } catch (err) {
     console.error("[POST /api/cases] Error:", err);
     return NextResponse.json(fail("Failed to create case"), { status: 500 });

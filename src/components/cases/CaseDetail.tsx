@@ -1,6 +1,6 @@
 "use client";
 
-import { CaseStatus, Priority } from "@prisma/client";
+import { CaseStatus, Priority } from "@/types/enums";
 import { useEffect, useState, useCallback } from "react";
 import { CasePriorityBadge } from "@/components/cases/CasePriorityBadge";
 import { CaseStatusBadge } from "@/components/cases/CaseStatusBadge";
@@ -17,7 +17,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
-import { Hash, UserCircle2, FileText, Paperclip } from "lucide-react";
+import { Hash, UserCircle2, FileText, Paperclip, Loader2 } from "lucide-react";
 
 type CaseDetailData = {
   id: string;
@@ -211,7 +211,10 @@ export function CaseDetail({
           {/* Status & Priority controls */}
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Status</p>
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+                Status
+                {updating && <Loader2 className="h-3 w-3 animate-spin text-primary" />}
+              </p>
               <select
                 className="h-9 w-full rounded-lg border bg-background px-3 text-sm ring-0 transition focus:ring-2 focus:ring-primary/40 disabled:opacity-50"
                 value={item.status}
@@ -226,7 +229,10 @@ export function CaseDetail({
               </select>
             </div>
             <div className="space-y-1.5">
-              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Priority</p>
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+                Priority
+                {updating && <Loader2 className="h-3 w-3 animate-spin text-primary" />}
+              </p>
               <select
                 className="h-9 w-full rounded-lg border bg-background px-3 text-sm ring-0 transition focus:ring-2 focus:ring-primary/40 disabled:opacity-50"
                 value={item.priority}

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { ok, fail } from "@/lib/api";
 import { auth } from "@/lib/auth";
 import { writeAudit } from "@/lib/audit";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { triggerPusherEvent } from "@/lib/pusher";
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -12,15 +12,17 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const conversation = await db.whatsAppConversation.findUnique({
-    where: { id },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("whatsapp_conversations")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
 
-  if (!conversation) {
-    return NextResponse.json(fail("Conversation not found"), { status: 404 });
-  }
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  if (!data) return NextResponse.json(fail("Conversation not found"), { status: 404 });
 
-  return NextResponse.json(ok(conversation));
+  return NextResponse.json(ok(data));
 }
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -30,13 +32,23 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const conversation = await db.whatsAppConversation.findUnique({
-    where: { id },
-  });
+  const sb = supabaseAdmin();
+  const { data: conversation, error: findErr } = await sb
+    .from("whatsapp_conversations")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
 
-  if (!conversation) {
-    return NextResponse.json(fail("Conversation not found"), { status: 404 });
-  }
+  if (findErr) return NextResponse.json(fail(findErr.message), { status: 500 });
+  if (!conversation) return NextResponse.json(fail("Conversation not found"), { status: 404 });
+
+  type Conv = {
+    id: string;
+    handledBy: string;
+    caseId: string | null;
+    agentId: string | null;
+  } & Record<string, unknown>;
+  const conv = conversation as Conv;
 
   const body = (await request.json()) as {
     handledBy?: string;
@@ -54,59 +66,57 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   if (body.tags) data.tags = body.tags;
   if (body.caseId) data.caseId = body.caseId;
 
-  // Handle handoff logic
   if (body.handledBy) {
     const newHandledBy = body.handledBy.toUpperCase();
     data.handledBy = newHandledBy;
 
-    if (newHandledBy === "HUMAN" && conversation.handledBy === "AI") {
+    if (newHandledBy === "HUMAN" && conv.handledBy === "AI") {
       data.agentId = session.user.id;
 
-      // Log activity if linked to a case
-      if (conversation.caseId) {
-        await db.activity.create({
-          data: {
-            caseId: conversation.caseId,
-            userId: session.user.id,
-            type: "FIELD_UPDATED",
-            description: `Agent ${session.user.name ?? session.user.email} took over WhatsApp conversation from AI`,
-          },
+      if (conv.caseId) {
+        await sb.from("activities").insert({
+          caseId: conv.caseId,
+          userId: session.user.id,
+          type: "FIELD_UPDATED",
+          description: `Agent ${session.user.name ?? session.user.email} took over WhatsApp conversation from AI`,
         });
       }
-    } else if (newHandledBy === "AI" && conversation.handledBy === "HUMAN") {
+    } else if (newHandledBy === "AI" && conv.handledBy === "HUMAN") {
       data.agentId = null;
 
-      if (conversation.caseId) {
-        await db.activity.create({
-          data: {
-            caseId: conversation.caseId,
-            userId: session.user.id,
-            type: "FIELD_UPDATED",
-            description: "Handed WhatsApp conversation back to AI agent",
-          },
+      if (conv.caseId) {
+        await sb.from("activities").insert({
+          caseId: conv.caseId,
+          userId: session.user.id,
+          type: "FIELD_UPDATED",
+          description: "Handed WhatsApp conversation back to AI agent",
         });
       }
     }
   }
 
-  const updated = await db.whatsAppConversation.update({
-    where: { id },
-    data,
-  });
+  const { data: updated, error: updErr } = await sb
+    .from("whatsapp_conversations")
+    .update(data)
+    .eq("id", id)
+    .select("*")
+    .single();
+
+  if (updErr) return NextResponse.json(fail(updErr.message), { status: 500 });
 
   await writeAudit({
     userId: session.user.id,
     action: "UPDATE",
     resource: "WhatsAppConversation",
     resourceId: id,
-    before: conversation,
+    before: conv,
     after: updated,
     req: request,
   });
 
   await triggerPusherEvent("whatsapp", "whatsapp:conversation_updated", {
     conversationId: id,
-    ...updated,
+    ...(updated as Record<string, unknown>),
   });
 
   return NextResponse.json(ok(updated));

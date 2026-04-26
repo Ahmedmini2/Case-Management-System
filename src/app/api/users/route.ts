@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "@/types/enums";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const createSchema = z.object({
   name: z.string().min(2).max(120),
@@ -19,13 +19,15 @@ export async function GET() {
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const users = await db.user.findMany({
-    where: { isActive: true },
-    orderBy: { createdAt: "asc" },
-    select: { id: true, name: true, email: true, image: true, role: true },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("users")
+    .select("id, name, email, image, role")
+    .eq("isActive", true)
+    .order("createdAt", { ascending: true });
 
-  return NextResponse.json(ok(users, { total: users.length }));
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data ?? [], { total: (data ?? []).length }));
 }
 
 export async function POST(request: Request) {
@@ -39,25 +41,29 @@ export async function POST(request: Request) {
     return NextResponse.json(fail("Invalid request body"), { status: 400 });
   }
 
-  const existing = await db.user.findUnique({
-    where: { email: parsed.data.email },
-    select: { id: true },
-  });
+  const sb = supabaseAdmin();
+  const { data: existing } = await sb
+    .from("users")
+    .select("id")
+    .eq("email", parsed.data.email)
+    .maybeSingle();
   if (existing) {
     return NextResponse.json(fail("Email already exists"), { status: 409 });
   }
 
   const passwordHash = await bcrypt.hash(parsed.data.password, 12);
-  const created = await db.user.create({
-    data: {
+  const { data: created, error } = await sb
+    .from("users")
+    .insert({
       name: parsed.data.name,
       email: parsed.data.email,
       passwordHash,
       role: parsed.data.role,
       isActive: true,
-    },
-    select: { id: true, name: true, email: true, role: true, createdAt: true },
-  });
+    })
+    .select("id, name, email, role, createdAt")
+    .single();
 
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
   return NextResponse.json(ok(created), { status: 201 });
 }

@@ -1,25 +1,31 @@
 import { NextResponse } from "next/server";
 import { fail } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export async function GET() {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const cases = await db.case.findMany({
-    orderBy: { createdAt: "desc" },
-    select: {
-      caseNumber: true,
-      title: true,
-      status: true,
-      priority: true,
-      source: true,
-      createdAt: true,
-      dueDate: true,
-    },
-    take: 2000,
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("cases")
+    .select("caseNumber, title, status, priority, source, createdAt, dueDate")
+    .order("createdAt", { ascending: false })
+    .limit(2000);
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  type CaseRow = {
+    caseNumber: string;
+    title: string;
+    status: string;
+    priority: string;
+    source: string;
+    createdAt: string;
+    dueDate: string | null;
+  };
+  const cases = ((data as CaseRow[] | null) ?? []);
 
   const lines = [
     "caseNumber,title,status,priority,source,createdAt,dueDate",
@@ -30,8 +36,8 @@ export async function GET() {
         c.status,
         c.priority,
         c.source,
-        c.createdAt.toISOString(),
-        c.dueDate?.toISOString() ?? "",
+        c.createdAt ? new Date(c.createdAt).toISOString() : "",
+        c.dueDate ? new Date(c.dueDate).toISOString() : "",
       ].join(","),
     ),
   ];

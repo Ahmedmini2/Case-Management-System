@@ -1,4 +1,4 @@
-import { ActivityType, CaseStatus, Priority } from "@prisma/client";
+import { CaseStatus, Priority } from "@/types/enums";
 import { after, NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
@@ -7,7 +7,7 @@ import { auth } from "@/lib/auth";
 import { writeAudit } from "@/lib/audit";
 import { enqueueEmailJob } from "@/lib/queue/jobs";
 import { triggerPusherEvent } from "@/lib/pusher";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const updateCaseSchema = z.object({
   title: z.string().min(3).max(200).optional(),
@@ -27,49 +27,146 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const item = await db.case.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      caseNumber: true,
-      title: true,
-      description: true,
-      status: true,
-      priority: true,
-      source: true,
-      createdAt: true,
-      updatedAt: true,
-      dueDate: true,
-      assignedTo: { select: { id: true, name: true, email: true, image: true } },
-      createdBy: { select: { id: true, name: true, email: true } },
-      comments: {
-        orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          body: true,
-          isInternal: true,
-          createdAt: true,
-          author: { select: { id: true, name: true, email: true } },
-        },
-      },
-      activities: {
-        orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          type: true,
-          description: true,
-          oldValue: true,
-          newValue: true,
-          createdAt: true,
-          user: { select: { id: true, name: true } },
-        },
-      },
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data: caseRow, error: caseErr } = await sb
+    .from("cases")
+    .select(
+      "id, caseNumber, title, description, status, priority, source, createdAt, updatedAt, dueDate, assignedToId, createdById",
+    )
+    .eq("id", id)
+    .maybeSingle();
 
-  if (!item) {
-    return NextResponse.json(fail("Case not found"), { status: 404 });
+  if (caseErr) return NextResponse.json(fail(caseErr.message), { status: 500 });
+  if (!caseRow) return NextResponse.json(fail("Case not found"), { status: 404 });
+
+  const c = caseRow as {
+    id: string;
+    caseNumber: string;
+    title: string;
+    description: string | null;
+    status: string;
+    priority: string;
+    source: string;
+    createdAt: string;
+    updatedAt: string;
+    dueDate: string | null;
+    assignedToId: string | null;
+    createdById: string | null;
+  };
+
+  // Fetch related users
+  const userIds = [c.assignedToId, c.createdById].filter(Boolean) as string[];
+  const userMap = new Map<string, { id: string; name: string | null; email: string; image: string | null }>();
+  if (userIds.length > 0) {
+    const { data: users } = await sb
+      .from("users")
+      .select("id, name, email, image")
+      .in("id", [...new Set(userIds)]);
+    for (const u of (users ?? []) as { id: string; name: string | null; email: string; image: string | null }[]) {
+      userMap.set(u.id, u);
+    }
   }
+
+  // Comments
+  const { data: rawComments } = await sb
+    .from("comments")
+    .select("id, body, isInternal, createdAt, authorId")
+    .eq("caseId", id)
+    .order("createdAt", { ascending: false });
+
+  const comments = ((rawComments ?? []) as {
+    id: string;
+    body: string;
+    isInternal: boolean;
+    createdAt: string;
+    authorId: string | null;
+  }[]);
+
+  // Activities
+  const { data: rawActivities } = await sb
+    .from("activities")
+    .select("id, type, description, oldValue, newValue, createdAt, userId")
+    .eq("caseId", id)
+    .order("createdAt", { ascending: false });
+
+  const activities = ((rawActivities ?? []) as {
+    id: string;
+    type: string;
+    description: string | null;
+    oldValue: string | null;
+    newValue: string | null;
+    createdAt: string;
+    userId: string | null;
+  }[]);
+
+  // Hydrate authors and activity users
+  const authorIds = [
+    ...new Set([
+      ...comments.map((c) => c.authorId).filter(Boolean),
+      ...activities.map((a) => a.userId).filter(Boolean),
+    ]),
+  ] as string[];
+  const missing = authorIds.filter((aid) => !userMap.has(aid));
+  if (missing.length > 0) {
+    const { data: extras } = await sb
+      .from("users")
+      .select("id, name, email")
+      .in("id", missing);
+    for (const u of (extras ?? []) as { id: string; name: string | null; email: string }[]) {
+      userMap.set(u.id, { id: u.id, name: u.name, email: u.email, image: null });
+    }
+  }
+
+  const item = {
+    id: c.id,
+    caseNumber: c.caseNumber,
+    title: c.title,
+    description: c.description,
+    status: c.status,
+    priority: c.priority,
+    source: c.source,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    dueDate: c.dueDate,
+    assignedTo: c.assignedToId
+      ? (() => {
+          const u = userMap.get(c.assignedToId);
+          return u ? { id: u.id, name: u.name, email: u.email, image: u.image } : null;
+        })()
+      : null,
+    createdBy: c.createdById
+      ? (() => {
+          const u = userMap.get(c.createdById);
+          return u ? { id: u.id, name: u.name, email: u.email } : null;
+        })()
+      : null,
+    comments: comments.map((cm) => ({
+      id: cm.id,
+      body: cm.body,
+      isInternal: cm.isInternal,
+      createdAt: cm.createdAt,
+      author: cm.authorId
+        ? (() => {
+            const u = userMap.get(cm.authorId);
+            return u ? { id: u.id, name: u.name, email: u.email } : null;
+          })()
+        : null,
+    })),
+    activities: activities.map((a) => ({
+      id: a.id,
+      type: a.type,
+      description: a.description,
+      oldValue: a.oldValue,
+      newValue: a.newValue,
+      createdAt: a.createdAt,
+      user: a.userId
+        ? (() => {
+            const u = userMap.get(a.userId);
+            return u ? { id: u.id, name: u.name } : null;
+          })()
+        : null,
+    })),
+  };
 
   return NextResponse.json(ok(item));
 }
@@ -81,10 +178,21 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const existing = await db.case.findUnique({ where: { id } });
-  if (!existing) {
-    return NextResponse.json(fail("Case not found"), { status: 404 });
-  }
+  const sb = supabaseAdmin();
+  const { data: existing, error: findErr } = await sb
+    .from("cases")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (findErr) return NextResponse.json(fail(findErr.message), { status: 500 });
+  if (!existing) return NextResponse.json(fail("Case not found"), { status: 404 });
+
+  const ex = existing as Record<string, unknown> & {
+    id: string;
+    status: string;
+    priority: string;
+    pipelineStageId: string | null;
+  };
 
   const json = await request.json();
   const parsed = updateCaseSchema.safeParse(json);
@@ -92,129 +200,155 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     return NextResponse.json(fail("Invalid request body"), { status: 400 });
   }
 
-  const updated = await db.$transaction(async (tx) => {
-    const nextStage =
-      typeof parsed.data.pipelineStageId !== "undefined" && parsed.data.pipelineStageId
-        ? await tx.pipelineStage.findUnique({
-            where: { id: parsed.data.pipelineStageId },
-            select: { name: true },
-          })
-        : null;
-    const nextCase = await tx.case.update({
-      where: { id },
-      data: {
-        ...parsed.data,
-        dueDate: parsed.data.dueDate ? new Date(parsed.data.dueDate) : parsed.data.dueDate,
-      },
-      select: {
-        id: true,
-        caseNumber: true,
-        title: true,
-        status: true,
-        priority: true,
-        dueDate: true,
-        updatedAt: true,
-      },
+  // Resolve next stage name (for activity log)
+  let nextStageName: string | null = null;
+  if (typeof parsed.data.pipelineStageId !== "undefined" && parsed.data.pipelineStageId) {
+    const { data: stage } = await sb
+      .from("pipeline_stages")
+      .select("name")
+      .eq("id", parsed.data.pipelineStageId)
+      .maybeSingle();
+    nextStageName = stage ? (stage as { name: string }).name : null;
+  }
+
+  const updatePayload: Record<string, unknown> = { ...parsed.data };
+  if (typeof parsed.data.dueDate !== "undefined") {
+    updatePayload.dueDate = parsed.data.dueDate ? new Date(parsed.data.dueDate).toISOString() : null;
+  }
+
+  const { data: updatedRow, error: updErr } = await sb
+    .from("cases")
+    .update(updatePayload)
+    .eq("id", id)
+    .select("id, caseNumber, title, status, priority, dueDate, updatedAt")
+    .single();
+  if (updErr || !updatedRow) {
+    return NextResponse.json(fail(updErr?.message ?? "Update failed"), { status: 500 });
+  }
+
+  const updated = updatedRow as {
+    id: string;
+    caseNumber: string;
+    title: string;
+    status: string;
+    priority: string;
+    dueDate: string | null;
+    updatedAt: string;
+  };
+
+  // Best-effort activities
+  if (parsed.data.status && parsed.data.status !== ex.status) {
+    const { error } = await sb.from("activities").insert({
+      caseId: id,
+      userId: session.user.id,
+      type: "STATUS_CHANGED",
+      description: "Status updated",
+      oldValue: ex.status,
+      newValue: parsed.data.status,
     });
+    if (error) console.error("[case:patch] activity STATUS failed:", error.message);
+  }
 
-    if (parsed.data.status && parsed.data.status !== existing.status) {
-      await tx.activity.create({
-        data: {
-          caseId: id,
-          userId: session.user.id,
-          type: ActivityType.STATUS_CHANGED,
-          description: "Status updated",
-          oldValue: existing.status,
-          newValue: parsed.data.status,
-        },
-      });
-    }
+  if (parsed.data.priority && parsed.data.priority !== ex.priority) {
+    const { error } = await sb.from("activities").insert({
+      caseId: id,
+      userId: session.user.id,
+      type: "PRIORITY_CHANGED",
+      description: "Priority updated",
+      oldValue: ex.priority,
+      newValue: parsed.data.priority,
+    });
+    if (error) console.error("[case:patch] activity PRIORITY failed:", error.message);
+  }
 
-    if (parsed.data.priority && parsed.data.priority !== existing.priority) {
-      await tx.activity.create({
-        data: {
-          caseId: id,
-          userId: session.user.id,
-          type: ActivityType.PRIORITY_CHANGED,
-          description: "Priority updated",
-          oldValue: existing.priority,
-          newValue: parsed.data.priority,
-        },
-      });
-    }
+  const stageChanged =
+    typeof parsed.data.pipelineStageId !== "undefined" &&
+    parsed.data.pipelineStageId !== ex.pipelineStageId;
 
-    if (
-      typeof parsed.data.pipelineStageId !== "undefined" &&
-      parsed.data.pipelineStageId !== existing.pipelineStageId
-    ) {
-      await tx.activity.create({
-        data: {
-          caseId: id,
-          userId: session.user.id,
-          type: ActivityType.STAGE_CHANGED,
-          description: "Pipeline stage updated",
-          oldValue: existing.pipelineStageId ?? "",
-          newValue: parsed.data.pipelineStageId ?? "",
-        },
-      });
-    }
+  if (stageChanged) {
+    const { error: stageActErr } = await sb.from("activities").insert({
+      caseId: id,
+      userId: session.user.id,
+      type: "STAGE_CHANGED",
+      description: "Pipeline stage updated",
+      oldValue: ex.pipelineStageId ?? "",
+      newValue: parsed.data.pipelineStageId ?? "",
+    });
+    if (stageActErr) console.error("[case:patch] activity STAGE failed:", stageActErr.message);
 
-    if (
-      typeof parsed.data.pipelineStageId !== "undefined" &&
-      parsed.data.pipelineStageId !== existing.pipelineStageId
-    ) {
-      const oldStageTagName = existing.pipelineStageId ? `stage:${existing.pipelineStageId}` : null;
-      const newStageTagName = parsed.data.pipelineStageId ? `stage:${parsed.data.pipelineStageId}` : null;
+    // Tag swap for stage:<id>
+    const oldStageTagName = ex.pipelineStageId ? `stage:${ex.pipelineStageId}` : null;
+    const newStageTagName = parsed.data.pipelineStageId ? `stage:${parsed.data.pipelineStageId}` : null;
 
-      if (oldStageTagName) {
-        const oldTag = await tx.tag.findUnique({
-          where: { name: oldStageTagName },
-          select: { id: true },
-        });
+    if (oldStageTagName) {
+      try {
+        const { data: oldTag } = await sb
+          .from("tags")
+          .select("id")
+          .eq("name", oldStageTagName)
+          .maybeSingle();
         if (oldTag) {
-          await tx.caseTag.deleteMany({
-            where: { caseId: id, tagId: oldTag.id },
-          });
+          await sb
+            .from("case_tags")
+            .delete()
+            .eq("caseId", id)
+            .eq("tagId", (oldTag as { id: string }).id);
         }
-      }
-
-      if (newStageTagName) {
-        const tag = await tx.tag.upsert({
-          where: { name: newStageTagName },
-          update: { color: "#0ea5e9" },
-          create: {
-            name: newStageTagName,
-            color: "#0ea5e9",
-          },
-          select: { id: true },
-        });
-        await tx.caseTag.upsert({
-          where: { caseId_tagId: { caseId: id, tagId: tag.id } },
-          update: {},
-          create: { caseId: id, tagId: tag.id },
-        });
-      }
-
-      if (nextStage?.name) {
-        await tx.activity.create({
-          data: {
-            caseId: id,
-            userId: session.user.id,
-            type: ActivityType.TAG_ADDED,
-            description: `Stage tag updated to ${nextStage.name}`,
-            newValue: nextStage.name,
-          },
-        });
+      } catch (err) {
+        console.error("[case:patch] old tag remove failed:", err);
       }
     }
 
-    return nextCase;
-  });
+    if (newStageTagName) {
+      try {
+        // Upsert tag
+        const { data: existingTag } = await sb
+          .from("tags")
+          .select("id")
+          .eq("name", newStageTagName)
+          .maybeSingle();
+
+        let tagId: string | null = existingTag ? (existingTag as { id: string }).id : null;
+
+        if (tagId) {
+          await sb.from("tags").update({ color: "#0ea5e9" }).eq("id", tagId);
+        } else {
+          const { data: newTag, error: newTagErr } = await sb
+            .from("tags")
+            .insert({ name: newStageTagName, color: "#0ea5e9" })
+            .select("id")
+            .single();
+          if (!newTagErr && newTag) tagId = (newTag as { id: string }).id;
+        }
+
+        if (tagId) {
+          // Upsert case_tags (composite key caseId+tagId)
+          await sb
+            .from("case_tags")
+            .upsert({ caseId: id, tagId }, { onConflict: "caseId,tagId" });
+        }
+      } catch (err) {
+        console.error("[case:patch] new tag upsert failed:", err);
+      }
+
+      if (nextStageName) {
+        const { error: tagActErr } = await sb.from("activities").insert({
+          caseId: id,
+          userId: session.user.id,
+          type: "TAG_ADDED",
+          description: `Stage tag updated to ${nextStageName}`,
+          newValue: nextStageName,
+        });
+        if (tagActErr) console.error("[case:patch] activity TAG_ADDED failed:", tagActErr.message);
+      }
+    }
+  }
 
   const actorUserId = session.user.id;
   const recipientEmail = session.user.email ?? null;
 
   after(async () => {
+    const sbAfter = supabaseAdmin();
     try {
       await writeAudit({
         userId: actorUserId,
@@ -222,7 +356,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
         action: "CASE_UPDATED",
         resource: "case",
         resourceId: id,
-        before: existing,
+        before: ex,
         after: updated,
         req: request,
       });
@@ -243,8 +377,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
 
     if (recipientEmail && (parsed.data.status || parsed.data.priority)) {
       try {
-        const emailRecord = await db.email.create({
-          data: {
+        const { data: emailRecord } = await sbAfter
+          .from("emails")
+          .insert({
             caseId: id,
             subject: `Case updated: ${updated.caseNumber}`,
             body: "A case was updated.",
@@ -255,22 +390,24 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
             cc: [],
             bcc: [],
             status: "PENDING",
-          },
-          select: { id: true },
-        });
+          })
+          .select("id")
+          .single();
 
-        await enqueueEmailJob({
-          emailId: emailRecord.id,
-          to: [recipientEmail],
-          subject: `Case updated: ${updated.caseNumber}`,
-          caseNumber: updated.caseNumber,
-          caseTitle: updated.title,
-          status: updated.status,
-          priority: updated.priority,
-          assignee: null,
-          updateMessage: "Status or priority changed.",
-          caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
-        });
+        if (emailRecord) {
+          await enqueueEmailJob({
+            emailId: (emailRecord as { id: string }).id,
+            to: [recipientEmail],
+            subject: `Case updated: ${updated.caseNumber}`,
+            caseNumber: updated.caseNumber,
+            caseTitle: updated.title,
+            status: updated.status,
+            priority: updated.priority,
+            assignee: null,
+            updateMessage: "Status or priority changed.",
+            caseUrl: `${process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"}/cases/${id}`,
+          });
+        }
       } catch (err) {
         console.error("[case:update] email job failed", err);
       }
@@ -282,7 +419,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
           triggerType: "CASE_STATUS_CHANGED",
           caseId: id,
           actorUserId,
-          payload: { oldStatus: existing.status, newStatus: parsed.data.status },
+          payload: { oldStatus: ex.status, newStatus: parsed.data.status },
         });
       } catch (err) {
         console.error("[case:update] automation STATUS failed", err);
@@ -295,23 +432,20 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
           triggerType: "CASE_PRIORITY_CHANGED",
           caseId: id,
           actorUserId,
-          payload: { oldPriority: existing.priority, newPriority: parsed.data.priority },
+          payload: { oldPriority: ex.priority, newPriority: parsed.data.priority },
         });
       } catch (err) {
         console.error("[case:update] automation PRIORITY failed", err);
       }
     }
 
-    if (
-      typeof parsed.data.pipelineStageId !== "undefined" &&
-      parsed.data.pipelineStageId !== existing.pipelineStageId
-    ) {
+    if (stageChanged) {
       try {
         await runAutomationEngine({
           triggerType: "STAGE_CHANGED",
           caseId: id,
           actorUserId,
-          payload: { oldStageId: existing.pipelineStageId, newStageId: parsed.data.pipelineStageId },
+          payload: { oldStageId: ex.pipelineStageId, newStageId: parsed.data.pipelineStageId },
         });
       } catch (err) {
         console.error("[case:update] automation STAGE failed", err);
@@ -329,15 +463,17 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const existing = await db.case.findUnique({
-    where: { id },
-    select: { id: true, caseNumber: true, title: true },
-  });
-  if (!existing) {
-    return NextResponse.json(fail("Case not found"), { status: 404 });
-  }
+  const sb = supabaseAdmin();
+  const { data: existing, error: findErr } = await sb
+    .from("cases")
+    .select("id, caseNumber, title")
+    .eq("id", id)
+    .maybeSingle();
+  if (findErr) return NextResponse.json(fail(findErr.message), { status: 500 });
+  if (!existing) return NextResponse.json(fail("Case not found"), { status: 404 });
 
-  await db.case.delete({ where: { id } });
+  const { error: delErr } = await sb.from("cases").delete().eq("id", id);
+  if (delErr) return NextResponse.json(fail(delErr.message), { status: 500 });
 
   await writeAudit({
     userId: session.user.id,

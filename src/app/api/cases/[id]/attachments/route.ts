@@ -1,11 +1,9 @@
-import { ActivityType } from "@prisma/client";
 import { NextResponse } from "next/server";
+import { randomUUID } from "crypto";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
-import { writeFile, mkdir } from "fs/promises";
-import { join } from "path";
-import { randomUUID } from "crypto";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+import { deleteFromBucket, StorageBuckets, uploadToBucket } from "@/lib/supabase/storage";
 
 const ALLOWED_TYPES = [
   "image/jpeg", "image/png", "image/webp", "image/gif",
@@ -24,19 +22,16 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const attachments = await db.attachment.findMany({
-    where: { caseId: id },
-    orderBy: { createdAt: "desc" },
-    select: {
-      id: true,
-      fileName: true,
-      fileSize: true,
-      mimeType: true,
-      url: true,
-      createdAt: true,
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("attachments")
+    .select("id, fileName, fileSize, mimeType, url, createdAt")
+    .eq("caseId", id)
+    .order("createdAt", { ascending: false });
 
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  const attachments = data ?? [];
   return NextResponse.json(ok(attachments, { total: attachments.length }));
 }
 
@@ -45,10 +40,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const caseRecord = await db.case.findUnique({
-    where: { id },
-    select: { id: true },
-  });
+  const sb = supabaseAdmin();
+  const { data: caseRecord, error: caseErr } = await sb
+    .from("cases")
+    .select("id")
+    .eq("id", id)
+    .maybeSingle();
+  if (caseErr) return NextResponse.json(fail(caseErr.message), { status: 500 });
   if (!caseRecord) return NextResponse.json(fail("Case not found"), { status: 404 });
 
   const formData = await request.formData();
@@ -63,35 +61,46 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   }
 
   const ext = file.name.split(".").pop() ?? "bin";
-  const key = `${randomUUID()}.${ext}`;
-  const uploadDir = join(process.cwd(), "public", "uploads", "attachments");
-  await mkdir(uploadDir, { recursive: true });
-  const bytes = await file.arrayBuffer();
-  await writeFile(join(uploadDir, key), Buffer.from(bytes));
-  const url = `/uploads/attachments/${key}`;
+  const key = `${id}/${randomUUID()}.${ext}`;
 
-  const attachment = await db.attachment.create({
-    data: {
+  let uploaded;
+  try {
+    uploaded = await uploadToBucket(StorageBuckets.Attachments, key, file, file.type);
+  } catch (err) {
+    return NextResponse.json(
+      fail(err instanceof Error ? err.message : "Upload failed"),
+      { status: 500 },
+    );
+  }
+
+  const { data: attachment, error: insertErr } = await sb
+    .from("attachments")
+    .insert({
       caseId: id,
       uploadedById: session.user.id,
       fileName: file.name,
       fileSize: file.size,
       mimeType: file.type,
-      url,
-      key,
-    },
-    select: { id: true, fileName: true, fileSize: true, mimeType: true, url: true, createdAt: true },
-  });
+      url: uploaded.url,
+      key: uploaded.key,
+    })
+    .select("id, fileName, fileSize, mimeType, url, createdAt")
+    .single();
 
-  await db.activity.create({
-    data: {
-      caseId: id,
-      userId: session.user.id,
-      type: ActivityType.ATTACHMENT_ADDED,
-      description: `Attached file: ${file.name}`,
-      newValue: file.name,
-    },
+  if (insertErr) {
+    // best-effort rollback of the storage object
+    await deleteFromBucket(StorageBuckets.Attachments, uploaded.key).catch(() => {});
+    return NextResponse.json(fail(insertErr.message), { status: 500 });
+  }
+
+  const { error: actErr } = await sb.from("activities").insert({
+    caseId: id,
+    userId: session.user.id,
+    type: "ATTACHMENT_ADDED",
+    description: `Attached file: ${file.name}`,
+    newValue: file.name,
   });
+  if (actErr) console.error("[attachments:create] best-effort activity failed:", actErr.message);
 
   return NextResponse.json(ok(attachment), { status: 201 });
 }
@@ -105,12 +114,26 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
   const attachmentId = searchParams.get("attachmentId");
   if (!attachmentId) return NextResponse.json(fail("attachmentId required"), { status: 400 });
 
-  const attachment = await db.attachment.findFirst({
-    where: { id: attachmentId, caseId: id },
-    select: { id: true },
-  });
+  const sb = supabaseAdmin();
+  const { data: attachment, error: findErr } = await sb
+    .from("attachments")
+    .select("id, key")
+    .eq("id", attachmentId)
+    .eq("caseId", id)
+    .maybeSingle();
+  if (findErr) return NextResponse.json(fail(findErr.message), { status: 500 });
   if (!attachment) return NextResponse.json(fail("Attachment not found"), { status: 404 });
 
-  await db.attachment.delete({ where: { id: attachmentId } });
+  const att = attachment as { id: string; key: string | null };
+
+  const { error: delErr } = await sb.from("attachments").delete().eq("id", attachmentId);
+  if (delErr) return NextResponse.json(fail(delErr.message), { status: 500 });
+
+  if (att.key) {
+    await deleteFromBucket(StorageBuckets.Attachments, att.key).catch((e) => {
+      console.error("[attachments:delete] storage cleanup failed:", e);
+    });
+  }
+
   return NextResponse.json(ok({ id: attachmentId }));
 }

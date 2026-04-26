@@ -1,4 +1,4 @@
-import { CaseStatus } from "@prisma/client";
+import { CaseStatus } from "@/types/enums";
 import { cn } from "@/lib/utils";
 
 const statusConfig: Record<

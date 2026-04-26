@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export async function GET(request: Request) {
   const session = await auth();
@@ -13,36 +13,81 @@ export async function GET(request: Request) {
   const action = searchParams.get("action");
   const userId = searchParams.get("userId");
 
-  const where = {
-    ...(action ? { action } : {}),
-    ...(userId ? { userId } : {}),
+  const sb = supabaseAdmin();
+
+  // For cursor pagination, fetch the cursor row's createdAt
+  let cursorCreatedAt: string | null = null;
+  if (cursor) {
+    const { data: cursorRow } = await sb
+      .from("audit_logs")
+      .select("createdAt")
+      .eq("id", cursor)
+      .maybeSingle();
+    cursorCreatedAt = (cursorRow as { createdAt: string } | null)?.createdAt ?? null;
+  }
+
+  const buildQuery = () => {
+    let q = sb.from("audit_logs").select("*", { count: "exact" });
+    if (action) q = q.eq("action", action);
+    if (userId) q = q.eq("userId", userId);
+    return q;
   };
 
-  const [rows, total] = await Promise.all([
-    db.auditLog.findMany({
-      where,
-      orderBy: { createdAt: "desc" },
-      take: take + 1,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      select: {
-        id: true,
-        action: true,
-        resource: true,
-        resourceId: true,
-        before: true,
-        after: true,
-        ipAddress: true,
-        userAgent: true,
-        createdAt: true,
-        user: { select: { id: true, name: true, email: true } },
-      },
-    }),
-    db.auditLog.count({ where }),
-  ]);
+  let query = buildQuery()
+    .order("createdAt", { ascending: false })
+    .limit(take + 1);
 
-  const hasMore = rows.length > take;
-  const data = hasMore ? rows.slice(0, take) : rows;
+  if (cursorCreatedAt) {
+    query = query.lt("createdAt", cursorCreatedAt);
+  }
+
+  const { data: rows, error, count } = await query;
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  type LogRow = {
+    id: string;
+    userId: string | null;
+    caseId: string | null;
+    action: string;
+    resource: string;
+    resourceId: string | null;
+    before: unknown;
+    after: unknown;
+    ipAddress: string | null;
+    userAgent: string | null;
+    createdAt: string;
+  };
+  const logRows = ((rows as LogRow[] | null) ?? []);
+
+  // Hydrate users
+  const userIds = [...new Set(logRows.map((r) => r.userId).filter(Boolean))] as string[];
+  const userMap = new Map<string, { id: string; name: string | null; email: string }>();
+  if (userIds.length > 0) {
+    const { data: users } = await sb
+      .from("users")
+      .select("id, name, email")
+      .in("id", userIds);
+    for (const u of (users ?? []) as { id: string; name: string | null; email: string }[]) {
+      userMap.set(u.id, u);
+    }
+  }
+
+  const enriched = logRows.map((r) => ({
+    id: r.id,
+    action: r.action,
+    resource: r.resource,
+    resourceId: r.resourceId,
+    before: r.before,
+    after: r.after,
+    ipAddress: r.ipAddress,
+    userAgent: r.userAgent,
+    createdAt: r.createdAt,
+    user: r.userId ? userMap.get(r.userId) ?? null : null,
+  }));
+
+  const hasMore = enriched.length > take;
+  const data = hasMore ? enriched.slice(0, take) : enriched;
   const nextCursor = hasMore ? data[data.length - 1]?.id ?? null : null;
 
-  return NextResponse.json(ok(data, { total, take, hasMore, nextCursor }));
+  return NextResponse.json(ok(data, { total: count ?? data.length, take, hasMore, nextCursor }));
 }

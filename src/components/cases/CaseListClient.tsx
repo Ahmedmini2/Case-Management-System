@@ -298,7 +298,7 @@ export function CaseListClient({ items }: Props) {
                           {item.dueDate && (
                             <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400">
                               <CalendarDays className="h-3.5 w-3.5" />
-                              Due {new Date(item.dueDate).toLocaleDateString()}
+                              Due {new Date(item.dueDate).toLocaleDateString("en-GB")}
                             </span>
                           )}
                         </div>

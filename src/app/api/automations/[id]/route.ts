@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const updateSchema = z.object({
   name: z.string().min(2).max(120).optional(),
@@ -17,9 +17,16 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const item = await db.automation.findUnique({ where: { id } });
-  if (!item) return NextResponse.json(fail("Automation not found"), { status: 404 });
-  return NextResponse.json(ok(item));
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("automations")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  if (!data) return NextResponse.json(fail("Automation not found"), { status: 404 });
+  return NextResponse.json(ok(data));
 }
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -29,14 +36,24 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   const parsed = updateSchema.safeParse(await request.json());
   if (!parsed.success) return NextResponse.json(fail("Invalid request body"), { status: 400 });
 
-  const updated = await db.automation.update({ where: { id }, data: parsed.data });
-  return NextResponse.json(ok(updated));
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("automations")
+    .update(parsed.data)
+    .eq("id", id)
+    .select("*")
+    .single();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data));
 }
 
 export async function DELETE(_: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
-  await db.automation.delete({ where: { id } });
+  const sb = supabaseAdmin();
+  const { error } = await sb.from("automations").delete().eq("id", id);
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
   return NextResponse.json(ok({ id }));
 }

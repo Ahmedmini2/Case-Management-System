@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { ok, fail } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const GRAPH_URL = "https://graph.facebook.com/v19.0";
 
@@ -10,17 +10,25 @@ export async function GET() {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const templates = await db.whatsAppTemplate.findMany({
-    orderBy: { createdAt: "desc" },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("whatsapp_templates")
+    .select("*")
+    .order("createdAt", { ascending: false });
 
-  return NextResponse.json(ok(templates));
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data ?? []));
 }
 
 // Create a new template via Meta API + save locally
 export async function POST(request: Request) {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
+
+  type ButtonInput =
+    | { type: "QUICK_REPLY"; text: string }
+    | { type: "URL"; text: string; url: string }
+    | { type: "PHONE_NUMBER"; text: string; phone: string };
 
   const body = (await request.json()) as {
     name?: string;
@@ -29,6 +37,7 @@ export async function POST(request: Request) {
     body?: string;
     header?: string;
     footer?: string;
+    buttons?: ButtonInput[];
   };
 
   const name = typeof body.name === "string" ? body.name.trim().toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "") : "";
@@ -37,13 +46,34 @@ export async function POST(request: Request) {
   const templateBody = typeof body.body === "string" ? body.body.trim() : "";
   const header = typeof body.header === "string" ? body.header.trim() : null;
   const footer = typeof body.footer === "string" ? body.footer.trim() : null;
+  const buttonsInput = Array.isArray(body.buttons) ? body.buttons.slice(0, 10) : [];
 
   if (!name) return NextResponse.json(fail("Template name is required"), { status: 400 });
   if (!templateBody) return NextResponse.json(fail("Template body is required"), { status: 400 });
 
-  // Count variables in body: {{1}}, {{2}}, etc.
   const varMatches = templateBody.match(/\{\{\d+\}\}/g) ?? [];
   const variableCount = new Set(varMatches).size;
+
+  // Validate Meta button-type limits
+  const counts = { QUICK_REPLY: 0, URL: 0, PHONE_NUMBER: 0 };
+  for (const b of buttonsInput) {
+    if (!b || typeof b.text !== "string" || !b.text.trim()) {
+      return NextResponse.json(fail("Each button must have non-empty text"), { status: 400 });
+    }
+    if (b.type === "URL" && (typeof b.url !== "string" || !/^https?:\/\//.test(b.url))) {
+      return NextResponse.json(fail(`URL button "${b.text}" needs a valid http(s) URL`), { status: 400 });
+    }
+    if (b.type === "PHONE_NUMBER" && (typeof b.phone !== "string" || !/^\+?\d{6,}$/.test(b.phone.replace(/\s/g, "")))) {
+      return NextResponse.json(fail(`Phone button "${b.text}" needs a valid phone number`), { status: 400 });
+    }
+    if (!(b.type in counts)) {
+      return NextResponse.json(fail(`Unknown button type: ${(b as { type: string }).type}`), { status: 400 });
+    }
+    counts[b.type]++;
+  }
+  if (counts.QUICK_REPLY > 3) return NextResponse.json(fail("Max 3 quick-reply buttons"), { status: 400 });
+  if (counts.URL > 2) return NextResponse.json(fail("Max 2 URL buttons"), { status: 400 });
+  if (counts.PHONE_NUMBER > 1) return NextResponse.json(fail("Max 1 phone button"), { status: 400 });
 
   const wabaId = process.env.WHATSAPP_BUSINESS_ACCOUNT_ID;
   const token = process.env.WHATSAPP_TOKEN;
@@ -52,7 +82,6 @@ export async function POST(request: Request) {
     return NextResponse.json(fail("WhatsApp Business Account ID not configured. Add WHATSAPP_BUSINESS_ACCOUNT_ID to .env.local"), { status: 500 });
   }
 
-  // Build Meta API payload
   const components: Record<string, unknown>[] = [];
 
   if (header) {
@@ -71,6 +100,15 @@ export async function POST(request: Request) {
 
   if (footer) {
     components.push({ type: "FOOTER", text: footer });
+  }
+
+  if (buttonsInput.length > 0) {
+    const metaButtons = buttonsInput.map((b) => {
+      if (b.type === "URL") return { type: "URL", text: b.text, url: b.url };
+      if (b.type === "PHONE_NUMBER") return { type: "PHONE_NUMBER", text: b.text, phone_number: b.phone };
+      return { type: "QUICK_REPLY", text: b.text };
+    });
+    components.push({ type: "BUTTONS", buttons: metaButtons });
   }
 
   try {
@@ -97,9 +135,10 @@ export async function POST(request: Request) {
       );
     }
 
-    // Save locally
-    const template = await db.whatsAppTemplate.create({
-      data: {
+    const sb = supabaseAdmin();
+    const { data: template, error } = await sb
+      .from("whatsapp_templates")
+      .insert({
         metaId: metaData.id ?? null,
         name,
         language,
@@ -108,10 +147,13 @@ export async function POST(request: Request) {
         body: templateBody,
         header,
         footer,
+        buttons: buttonsInput.length > 0 ? buttonsInput : null,
         variableCount,
-      },
-    });
+      })
+      .select("*")
+      .single();
 
+    if (error) return NextResponse.json(fail(error.message), { status: 500 });
     return NextResponse.json(ok(template), { status: 201 });
   } catch (err) {
     console.error("[WhatsApp Templates] Create error:", err);

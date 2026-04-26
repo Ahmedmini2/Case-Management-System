@@ -1,105 +1,174 @@
 import Link from "next/link";
 import { KanbanBoard } from "@/components/kanban/KanbanBoard";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
-import { Map } from "lucide-react";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+import { Map as MapIcon } from "lucide-react";
+import type { Priority } from "@/types/enums";
 
-async function getOrCreateDefaultPipeline() {
-  // Single query: find the default pipeline with all data needed
-  let pipeline = await db.pipeline.findFirst({
-    where: { isDefault: true },
-    select: {
-      id: true,
-      name: true,
-      stages: {
-        orderBy: { position: "asc" },
-        select: {
-          id: true,
-          name: true,
-          color: true,
-          position: true,
-          cases: {
-            orderBy: { updatedAt: "desc" },
-            take: 100,
-            select: {
-              id: true,
-              caseNumber: true,
-              title: true,
-              priority: true,
-              dueDate: true,
-              assignedTo: { select: { id: true, name: true } },
-            },
-          },
-        },
-      },
-    },
-  });
+type StageWithCases = {
+  id: string;
+  name: string;
+  color: string;
+  position: number;
+  cases: {
+    id: string;
+    caseNumber: string;
+    title: string;
+    priority: Priority;
+    dueDate: string | null;
+    assignedTo: { id: string; name: string | null } | null;
+  }[];
+};
 
-  if (pipeline) return pipeline;
+type PipelineWithStages = {
+  id: string;
+  name: string;
+  stages: StageWithCases[];
+};
 
-  // No default pipeline — find any pipeline with cases, or create one
-  const anyWithCases = await db.pipeline.findFirst({
-    where: { cases: { some: {} } },
-    orderBy: { createdAt: "asc" },
-    select: { id: true },
-  });
+async function loadPipelineWithStagesAndCases(pipelineId: string): Promise<PipelineWithStages | null> {
+  const sb = supabaseAdmin();
+  const { data: pRow } = await sb
+    .from("pipelines")
+    .select("id, name")
+    .eq("id", pipelineId)
+    .maybeSingle();
+  if (!pRow) return null;
 
-  const targetId = anyWithCases?.id ?? (await db.pipeline.findFirst({
-    orderBy: { createdAt: "asc" },
-    select: { id: true },
-  }))?.id;
+  const { data: stagesRaw } = await sb
+    .from("pipeline_stages")
+    .select("id, name, color, position")
+    .eq("pipelineId", pipelineId)
+    .order("position", { ascending: true });
 
-  if (targetId) {
-    await db.pipeline.updateMany({ data: { isDefault: false } });
-    await db.pipeline.update({ where: { id: targetId }, data: { isDefault: true } });
-  } else {
-    // Create a default pipeline
-    await db.pipeline.create({
-      data: {
-        name: "Default Pipeline",
-        isDefault: true,
-        stages: {
-          create: [
-            { name: "Backlog", color: "#6366f1", position: 0 },
-            { name: "In Progress", color: "#0ea5e9", position: 1 },
-            { name: "Done", color: "#22c55e", position: 2, isTerminal: true },
-          ],
-        },
-      },
-    });
+  const stages = (stagesRaw ?? []) as {
+    id: string;
+    name: string;
+    color: string;
+    position: number;
+  }[];
+
+  const stageIds = stages.map((s) => s.id);
+  const casesByStage = new Map<string, StageWithCases["cases"]>();
+  if (stageIds.length > 0) {
+    const { data: caseRowsRaw } = await sb
+      .from("cases")
+      .select("id, caseNumber, title, priority, dueDate, assignedToId, pipelineStageId, updatedAt")
+      .in("pipelineStageId", stageIds)
+      .order("updatedAt", { ascending: false })
+      .limit(100 * stageIds.length);
+
+    const caseRows = (caseRowsRaw ?? []) as {
+      id: string;
+      caseNumber: string;
+      title: string;
+      priority: string;
+      dueDate: string | null;
+      assignedToId: string | null;
+      pipelineStageId: string | null;
+      updatedAt: string;
+    }[];
+
+    const assigneeIds = [
+      ...new Set(caseRows.map((c) => c.assignedToId).filter(Boolean) as string[]),
+    ];
+    const assigneeMap = new Map<string, { id: string; name: string | null }>();
+    if (assigneeIds.length > 0) {
+      const { data: users } = await sb
+        .from("users")
+        .select("id, name")
+        .in("id", assigneeIds);
+      for (const u of (users ?? []) as { id: string; name: string | null }[]) {
+        assigneeMap.set(u.id, u);
+      }
+    }
+
+    for (const c of caseRows) {
+      if (!c.pipelineStageId) continue;
+      const list = casesByStage.get(c.pipelineStageId) ?? [];
+      if (list.length >= 100) continue;
+      list.push({
+        id: c.id,
+        caseNumber: c.caseNumber,
+        title: c.title,
+        priority: c.priority as Priority,
+        dueDate: c.dueDate,
+        assignedTo: c.assignedToId ? assigneeMap.get(c.assignedToId) ?? null : null,
+      });
+      casesByStage.set(c.pipelineStageId, list);
+    }
   }
 
-  // Fetch freshly set default
-  pipeline = await db.pipeline.findFirst({
-    where: { isDefault: true },
-    select: {
-      id: true,
-      name: true,
-      stages: {
-        orderBy: { position: "asc" },
-        select: {
-          id: true,
-          name: true,
-          color: true,
-          position: true,
-          cases: {
-            orderBy: { updatedAt: "desc" },
-            take: 100,
-            select: {
-              id: true,
-              caseNumber: true,
-              title: true,
-              priority: true,
-              dueDate: true,
-              assignedTo: { select: { id: true, name: true } },
-            },
-          },
-        },
-      },
-    },
-  });
+  const p = pRow as { id: string; name: string };
+  return {
+    id: p.id,
+    name: p.name,
+    stages: stages.map((s) => ({
+      ...s,
+      cases: casesByStage.get(s.id) ?? [],
+    })),
+  };
+}
 
-  return pipeline;
+async function getOrCreateDefaultPipeline(): Promise<PipelineWithStages | null> {
+  const sb = supabaseAdmin();
+
+  const { data: defaultRow } = await sb
+    .from("pipelines")
+    .select("id")
+    .eq("isDefault", true)
+    .maybeSingle();
+
+  if (defaultRow) {
+    return loadPipelineWithStagesAndCases((defaultRow as { id: string }).id);
+  }
+
+  // No default pipeline — find any pipeline with cases first
+  let targetId: string | null = null;
+  const { data: caseRows } = await sb
+    .from("cases")
+    .select("pipelineId")
+    .not("pipelineId", "is", null)
+    .limit(1);
+  const caseRow = (caseRows ?? [])[0] as { pipelineId: string | null } | undefined;
+  if (caseRow?.pipelineId) {
+    targetId = caseRow.pipelineId;
+  } else {
+    const { data: anyPipe } = await sb
+      .from("pipelines")
+      .select("id")
+      .order("createdAt", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    targetId = anyPipe ? (anyPipe as { id: string }).id : null;
+  }
+
+  if (targetId) {
+    await sb
+      .from("pipelines")
+      .update({ isDefault: false })
+      .neq("id", "00000000-0000-0000-0000-000000000000");
+    await sb.from("pipelines").update({ isDefault: true }).eq("id", targetId);
+  } else {
+    // Create a default pipeline + stages
+    const { data: newPipe } = await sb
+      .from("pipelines")
+      .insert({ name: "Default Pipeline", isDefault: true })
+      .select("id")
+      .single();
+    if (newPipe) {
+      const newId = (newPipe as { id: string }).id;
+      await sb.from("pipeline_stages").insert([
+        { pipelineId: newId, name: "Backlog", color: "#6366f1", position: 0 },
+        { pipelineId: newId, name: "In Progress", color: "#0ea5e9", position: 1 },
+        { pipelineId: newId, name: "Done", color: "#22c55e", position: 2, isTerminal: true },
+      ]);
+      targetId = newId;
+    }
+  }
+
+  if (!targetId) return null;
+  return loadPipelineWithStagesAndCases(targetId);
 }
 
 export default async function BoardPage() {
@@ -122,11 +191,22 @@ export default async function BoardPage() {
   // Backfill cases with no pipeline assignment (fire-and-forget, non-blocking)
   const firstStageId = pipeline.stages[0]?.id;
   if (firstStageId) {
-    // Run without await so it doesn't block page render
-    void db.case.updateMany({
-      where: { OR: [{ pipelineId: null }, { pipelineStageId: null }] },
-      data: { pipelineId: pipeline.id, pipelineStageId: firstStageId },
-    }).catch(() => {/* non-critical */});
+    const sb = supabaseAdmin();
+    void (async () => {
+      try {
+        // Cases missing pipelineId
+        await sb
+          .from("cases")
+          .update({ pipelineId: pipeline.id, pipelineStageId: firstStageId })
+          .is("pipelineId", null);
+        await sb
+          .from("cases")
+          .update({ pipelineId: pipeline.id, pipelineStageId: firstStageId })
+          .is("pipelineStageId", null);
+      } catch {
+        /* non-critical */
+      }
+    })();
   }
 
   return (
@@ -134,7 +214,7 @@ export default async function BoardPage() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary/10">
-            <Map className="h-5 w-5 text-primary" />
+            <MapIcon className="h-5 w-5 text-primary" />
           </div>
           <div>
             <h1 className="text-xl font-bold tracking-tight">{pipeline.name}</h1>
@@ -155,7 +235,7 @@ export default async function BoardPage() {
             ...stage,
             cases: stage.cases.map((item) => ({
               ...item,
-              dueDate: item.dueDate?.toISOString() ?? null,
+              dueDate: item.dueDate,
             })),
           })),
         }}

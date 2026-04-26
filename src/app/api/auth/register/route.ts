@@ -1,8 +1,8 @@
 import bcrypt from "bcryptjs";
 import { NextResponse } from "next/server";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "@/types/enums";
 import { z } from "zod";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const registerSchema = z.object({
   name: z.string().min(2).max(100),
@@ -22,10 +22,13 @@ export async function POST(request: Request) {
       );
     }
 
-    const existing = await db.user.findUnique({
-      where: { email: parsed.data.email },
-      select: { id: true },
-    });
+    const sb = supabaseAdmin();
+
+    const { data: existing } = await sb
+      .from("users")
+      .select("id")
+      .eq("email", parsed.data.email)
+      .maybeSingle();
     if (existing) {
       return NextResponse.json(
         { data: null, error: "Email already registered", meta: null },
@@ -34,20 +37,25 @@ export async function POST(request: Request) {
     }
 
     const passwordHash = await bcrypt.hash(parsed.data.password, 12);
-    const user = await db.user.create({
-      data: {
+    const { data: user, error: createErr } = await sb
+      .from("users")
+      .insert({
         name: parsed.data.name,
         email: parsed.data.email,
         passwordHash,
         role: UserRole.AGENT,
-      },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-      },
-    });
+      })
+      .select("id, name, email")
+      .single();
 
+    if (createErr || !user) {
+      return NextResponse.json(
+        { data: null, error: createErr?.message ?? "Failed to register user", meta: null },
+        { status: 500 },
+      );
+    }
+
+    void request;
     return NextResponse.json({ data: user, error: null, meta: null }, { status: 201 });
   } catch {
     return NextResponse.json(

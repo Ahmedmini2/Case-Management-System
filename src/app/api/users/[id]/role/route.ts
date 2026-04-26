@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "@/types/enums";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const schema = z.object({
   role: z.nativeEnum(UserRole),
@@ -21,11 +21,14 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     return NextResponse.json(fail("Invalid request body"), { status: 400 });
   }
 
-  const updated = await db.user.update({
-    where: { id },
-    data: { role: parsed.data.role },
-    select: { id: true, name: true, email: true, role: true },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("users")
+    .update({ role: parsed.data.role })
+    .eq("id", id)
+    .select("id, name, email, role")
+    .single();
 
-  return NextResponse.json(ok(updated));
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data));
 }

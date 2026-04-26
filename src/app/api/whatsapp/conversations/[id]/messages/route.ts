@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { ok, fail } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export async function GET(_: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -10,33 +10,37 @@ export async function GET(_: Request, { params }: { params: Promise<{ id: string
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const conversation = await db.whatsAppConversation.findUnique({
-    where: { id },
-    select: { id: true },
-  });
+  const sb = supabaseAdmin();
+  const { data: conversation, error: convErr } = await sb
+    .from("whatsapp_conversations")
+    .select("id")
+    .eq("id", id)
+    .maybeSingle();
+  if (convErr) return NextResponse.json(fail(convErr.message), { status: 500 });
+  if (!conversation) return NextResponse.json(fail("Conversation not found"), { status: 404 });
 
-  if (!conversation) {
-    return NextResponse.json(fail("Conversation not found"), { status: 404 });
-  }
-
-  // Mark unread inbound messages as read
-  await db.whatsAppMessage.updateMany({
-    where: { conversationId: id, direction: "inbound", isRead: false },
-    data: { isRead: true },
-  });
+  // Mark unread inbound messages as read (best-effort)
+  await sb
+    .from("whatsapp_messages")
+    .update({ isRead: true })
+    .eq("conversationId", id)
+    .eq("direction", "inbound")
+    .eq("isRead", false);
 
   // Reset unread count on conversation
-  await db.whatsAppConversation.update({
-    where: { id },
-    data: { unreadCount: 0 },
-  });
+  await sb
+    .from("whatsapp_conversations")
+    .update({ unreadCount: 0 })
+    .eq("id", id);
 
-  const messages = await db.whatsAppMessage.findMany({
-    where: { conversationId: id },
-    orderBy: { timestamp: "asc" },
-  });
+  const { data: messages, error: msgErr } = await sb
+    .from("whatsapp_messages")
+    .select("*")
+    .eq("conversationId", id)
+    .order("timestamp", { ascending: true });
 
-  return NextResponse.json(ok(messages));
+  if (msgErr) return NextResponse.json(fail(msgErr.message), { status: 500 });
+  return NextResponse.json(ok(messages ?? []));
 }
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -46,13 +50,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     return NextResponse.json(fail("Unauthorized"), { status: 401 });
   }
 
-  const conversation = await db.whatsAppConversation.findUnique({
-    where: { id },
-  });
+  const sb = supabaseAdmin();
+  const { data: conversation, error: convErr } = await sb
+    .from("whatsapp_conversations")
+    .select("id, contactPhone")
+    .eq("id", id)
+    .maybeSingle();
+  if (convErr) return NextResponse.json(fail(convErr.message), { status: 500 });
+  if (!conversation) return NextResponse.json(fail("Conversation not found"), { status: 404 });
 
-  if (!conversation) {
-    return NextResponse.json(fail("Conversation not found"), { status: 404 });
-  }
+  const conv = conversation as { id: string; contactPhone: string };
 
   const body = (await request.json()) as { body?: string };
   const messageBody = typeof body.body === "string" ? body.body.trim() : "";
@@ -77,7 +84,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           },
           body: JSON.stringify({
             messaging_product: "whatsapp",
-            to: conversation.contactPhone,
+            to: conv.contactPhone,
             type: "text",
             text: { body: messageBody },
           }),
@@ -93,33 +100,43 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
   }
 
-  // Save sent message to DB
-  const user = await db.user.findUnique({
-    where: { id: session.user.id },
-    select: { name: true, email: true },
-  });
+  // Look up sender display name
+  const { data: user } = await sb
+    .from("users")
+    .select("name, email")
+    .eq("id", session.user.id)
+    .maybeSingle();
+  const senderName =
+    (user as { name?: string | null; email?: string } | null)?.name ??
+    (user as { email?: string } | null)?.email ??
+    "Agent";
 
-  const message = await db.whatsAppMessage.create({
-    data: {
+  // Save sent message
+  const { data: message, error: insErr } = await sb
+    .from("whatsapp_messages")
+    .insert({
       conversationId: id,
       direction: "outbound",
       sender: "agent",
-      senderName: user?.name ?? user?.email ?? "Agent",
+      senderName,
       body: messageBody,
       isAI: false,
       status: "sent",
       isRead: true,
-    },
-  });
+    })
+    .select("*")
+    .single();
 
-  // Update conversation last message
-  await db.whatsAppConversation.update({
-    where: { id },
-    data: {
+  if (insErr) return NextResponse.json(fail(insErr.message), { status: 500 });
+
+  // Update conversation last message (best-effort)
+  await sb
+    .from("whatsapp_conversations")
+    .update({
       lastMessage: messageBody.length > 200 ? messageBody.slice(0, 200) + "..." : messageBody,
-      lastMessageAt: new Date(),
-    },
-  });
+      lastMessageAt: new Date().toISOString(),
+    })
+    .eq("id", id);
 
   return NextResponse.json(ok(message), { status: 201 });
 }

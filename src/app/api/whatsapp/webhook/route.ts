@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { triggerPusherEvent } from "@/lib/pusher";
 
 // WhatsApp webhook verification
@@ -19,6 +19,7 @@ export async function GET(request: Request) {
 // Receive incoming WhatsApp messages
 export async function POST(request: Request) {
   try {
+    const sb = supabaseAdmin();
     const payload = (await request.json()) as Record<string, unknown>;
 
     // WhatsApp sends nested: entry[0].changes[0].value
@@ -40,7 +41,6 @@ export async function POST(request: Request) {
         for (const status of statuses as Record<string, unknown>[]) {
           const waMsgId = typeof status.id === "string" ? status.id : null;
           const statusValue = typeof status.status === "string" ? status.status : "";
-          const recipientId = typeof status.recipient_id === "string" ? status.recipient_id : null;
 
           if (!waMsgId || !statusValue) continue;
 
@@ -53,30 +53,32 @@ export async function POST(request: Request) {
 
           // Update WhatsAppMessage in conversation
           try {
-            await db.whatsAppMessage.updateMany({
-              where: { whatsappMsgId: waMsgId },
-              data: { status: mappedStatus },
-            });
+            await sb
+              .from("whatsapp_messages")
+              .update({ status: mappedStatus })
+              .eq("whatsappMsgId", waMsgId);
           } catch { /* message might not exist locally */ }
 
           // Update BroadcastRecipient for broadcast tracking
           try {
-            const recipient = await db.broadcastRecipient.findFirst({
-              where: { whatsappMsgId: waMsgId },
-              select: { id: true, broadcastId: true, status: true },
-            });
+            const { data: recipient } = await sb
+              .from("broadcast_recipients")
+              .select("id, broadcastId, status")
+              .eq("whatsappMsgId", waMsgId)
+              .maybeSingle();
 
             if (recipient) {
-              const now = new Date();
+              const r = recipient as { id: string; broadcastId: string; status: string | null };
+              const now = new Date().toISOString();
               const updateData: Record<string, unknown> = {};
 
-              if (mappedStatus === "delivered" && recipient.status !== "READ") {
+              if (mappedStatus === "delivered" && r.status !== "READ") {
                 updateData.status = "DELIVERED";
                 updateData.deliveredAt = now;
               } else if (mappedStatus === "read") {
                 updateData.status = "READ";
                 updateData.readAt = now;
-                if (!recipient.status || recipient.status === "SENT" || recipient.status === "PENDING") {
+                if (!r.status || r.status === "SENT" || r.status === "PENDING") {
                   updateData.deliveredAt = now;
                 }
               } else if (mappedStatus === "failed") {
@@ -87,27 +89,28 @@ export async function POST(request: Request) {
               }
 
               if (Object.keys(updateData).length > 0) {
-                await db.broadcastRecipient.update({
-                  where: { id: recipient.id },
-                  data: updateData,
-                });
+                await sb.from("broadcast_recipients").update(updateData).eq("id", r.id);
 
                 // Recalculate broadcast aggregate counts
-                const counts = await db.broadcastRecipient.groupBy({
-                  by: ["status"],
-                  where: { broadcastId: recipient.broadcastId },
-                  _count: true,
-                });
+                const { data: allRecipients } = await sb
+                  .from("broadcast_recipients")
+                  .select("status")
+                  .eq("broadcastId", r.broadcastId);
 
-                const countMap = new Map(counts.map((c) => [c.status, c._count]));
-                await db.broadcast.update({
-                  where: { id: recipient.broadcastId },
-                  data: {
-                    deliveredCount: (countMap.get("DELIVERED") ?? 0) + (countMap.get("READ") ?? 0),
-                    readCount: countMap.get("READ") ?? 0,
-                    failedCount: countMap.get("FAILED") ?? 0,
-                  },
-                });
+                const counts = new Map<string, number>();
+                for (const item of (allRecipients ?? []) as { status: string | null }[]) {
+                  const k = item.status ?? "";
+                  counts.set(k, (counts.get(k) ?? 0) + 1);
+                }
+
+                await sb
+                  .from("broadcasts")
+                  .update({
+                    deliveredCount: (counts.get("DELIVERED") ?? 0) + (counts.get("READ") ?? 0),
+                    readCount: counts.get("READ") ?? 0,
+                    failedCount: counts.get("FAILED") ?? 0,
+                  })
+                  .eq("id", r.broadcastId);
               }
             }
           } catch (err) {
@@ -147,56 +150,85 @@ export async function POST(request: Request) {
           const profile = contactEntry?.profile as Record<string, unknown> | undefined;
           const contactName = typeof profile?.name === "string" ? profile.name : from;
 
-          // Find or create conversation
-          const conversation = await db.whatsAppConversation.upsert({
-            where: { contactPhone: from },
-            update: {
-              contactName,
-              lastMessage: body.length > 200 ? body.slice(0, 200) + "..." : body,
-              lastMessageAt: timestamp,
-              unreadCount: { increment: 1 },
-            },
-            create: {
-              contactName,
-              contactPhone: from,
-              lastMessage: body.length > 200 ? body.slice(0, 200) + "..." : body,
-              lastMessageAt: timestamp,
-              unreadCount: 1,
-            },
-          });
+          // Find or create conversation. Try to fetch existing first to handle increment properly.
+          const lastMsg = body.length > 200 ? body.slice(0, 200) + "..." : body;
+          const tsIso = timestamp.toISOString();
+
+          const { data: existingConv } = await sb
+            .from("whatsapp_conversations")
+            .select("id, unreadCount, handledBy")
+            .eq("contactPhone", from)
+            .maybeSingle();
+
+          let conversationId: string;
+          let handledBy: string | null = null;
+
+          if (existingConv) {
+            const ec = existingConv as { id: string; unreadCount: number | null; handledBy: string | null };
+            conversationId = ec.id;
+            handledBy = ec.handledBy;
+            const { error: updErr } = await sb
+              .from("whatsapp_conversations")
+              .update({
+                contactName,
+                lastMessage: lastMsg,
+                lastMessageAt: tsIso,
+                unreadCount: (ec.unreadCount ?? 0) + 1,
+              })
+              .eq("id", ec.id);
+            if (updErr) console.error("[WhatsApp Webhook] Conv update failed:", updErr.message);
+          } else {
+            const { data: newConv, error: insErr } = await sb
+              .from("whatsapp_conversations")
+              .insert({
+                contactName,
+                contactPhone: from,
+                lastMessage: lastMsg,
+                lastMessageAt: tsIso,
+                unreadCount: 1,
+              })
+              .select("id, handledBy")
+              .single();
+            if (insErr || !newConv) {
+              console.error("[WhatsApp Webhook] Conv create failed:", insErr?.message);
+              continue;
+            }
+            const nc = newConv as { id: string; handledBy: string | null };
+            conversationId = nc.id;
+            handledBy = nc.handledBy;
+          }
 
           // Save inbound message
-          await db.whatsAppMessage.create({
-            data: {
-              conversationId: conversation.id,
-              whatsappMsgId: msgId,
-              direction: "inbound",
-              sender: "customer",
-              senderName: contactName,
-              body,
-              mediaUrl,
-              mediaType,
-              isAI: false,
-              status: "delivered",
-              timestamp,
-            },
+          const { error: msgErr } = await sb.from("whatsapp_messages").insert({
+            conversationId,
+            whatsappMsgId: msgId,
+            direction: "inbound",
+            sender: "customer",
+            senderName: contactName,
+            body,
+            mediaUrl,
+            mediaType,
+            isAI: false,
+            status: "delivered",
+            timestamp: tsIso,
           });
+          if (msgErr) console.error("[WhatsApp Webhook] Save message failed:", msgErr.message);
 
           // If AI is handling, forward to AI agent webhook
-          if (conversation.handledBy === "AI" && process.env.AI_AGENT_WEBHOOK_URL) {
+          if (handledBy === "AI" && process.env.AI_AGENT_WEBHOOK_URL) {
             fetch(process.env.AI_AGENT_WEBHOOK_URL, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                conversationId: conversation.id,
+                conversationId,
                 contactPhone: from,
                 contactName,
                 messageId: msgId,
                 body,
                 mediaUrl,
                 mediaType,
-                handledBy: conversation.handledBy,
-                timestamp: timestamp.toISOString(),
+                handledBy,
+                timestamp: tsIso,
               }),
             }).catch((err) =>
               console.error("[WhatsApp Webhook] AI forward error:", err),
@@ -204,40 +236,44 @@ export async function POST(request: Request) {
           }
 
           // If human-handled, push real-time update
-          if (conversation.handledBy === "HUMAN") {
+          if (handledBy === "HUMAN") {
             await triggerPusherEvent(
-              `conversation-${conversation.id}`,
+              `conversation-${conversationId}`,
               "whatsapp:new_message",
               {
-                conversationId: conversation.id,
+                conversationId,
                 messageId: msgId,
                 from,
                 body,
-                timestamp: timestamp.toISOString(),
+                timestamp: tsIso,
               },
             );
           }
 
           // Create notification for all active agents
-          const agents = await db.user.findMany({
-            where: { role: { in: ["ADMIN", "SUPER_ADMIN", "MANAGER", "AGENT"] }, isActive: true },
-            select: { id: true },
-          });
-          if (agents.length > 0) {
-            await db.notification.createMany({
-              data: agents.map((a) => ({
+          const { data: agents } = await sb
+            .from("users")
+            .select("id")
+            .in("role", ["ADMIN", "SUPER_ADMIN", "MANAGER", "AGENT"])
+            .eq("isActive", true);
+
+          const agentList = (agents ?? []) as { id: string }[];
+          if (agentList.length > 0) {
+            const { error: notifErr } = await sb.from("notifications").insert(
+              agentList.map((a) => ({
                 userId: a.id,
                 type: "WHATSAPP",
                 title: `WhatsApp: ${contactName}`,
                 body: body.length > 100 ? body.slice(0, 100) + "..." : body,
                 link: "/whatsapp",
               })),
-            });
+            );
+            if (notifErr) console.error("[WhatsApp Webhook] Notif create failed:", notifErr.message);
           }
 
           // Also update conversation list for all agents
           await triggerPusherEvent("whatsapp", "whatsapp:conversation_updated", {
-            conversationId: conversation.id,
+            conversationId,
           });
         }
       }

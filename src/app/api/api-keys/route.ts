@@ -3,7 +3,7 @@ import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { generateApiKey, getApiKeyPrefix, hashApiKey, type ApiKeyScope } from "@/lib/api-keys";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const createApiKeySchema = z.object({
   name: z.string().min(2).max(100),
@@ -24,19 +24,24 @@ export async function GET() {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const items = await db.apiKey.findMany({
-    orderBy: { createdAt: "desc" },
-    select: {
-      id: true,
-      name: true,
-      prefix: true,
-      isActive: true,
-      createdAt: true,
-      expiresAt: true,
-      lastUsedAt: true,
-    },
-  });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("api_keys")
+    .select("id, name, prefix, isActive, createdAt, expiresAt, lastUsedAt")
+    .order("createdAt", { ascending: false });
 
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  type Row = {
+    id: string;
+    name: string;
+    prefix: string;
+    isActive: boolean;
+    createdAt: string;
+    expiresAt: string | null;
+    lastUsedAt: string | null;
+  };
+  const items = (data as Row[] | null) ?? [];
   return NextResponse.json(
     ok(
       items.map((item) => {
@@ -59,15 +64,19 @@ export async function POST(request: Request) {
   const keyHash = await hashApiKey(rawKey);
   const prefix = getApiKeyPrefix(rawKey);
 
-  const created = await db.apiKey.create({
-    data: {
+  const sb = supabaseAdmin();
+  const { data: created, error } = await sb
+    .from("api_keys")
+    .insert({
       name: `${payload.data.name} [${payload.data.scope}]`,
       keyHash,
       prefix,
-      expiresAt: payload.data.expiresAt ? new Date(payload.data.expiresAt) : null,
-    },
-    select: { id: true, name: true, prefix: true, createdAt: true, expiresAt: true },
-  });
+      expiresAt: payload.data.expiresAt ? new Date(payload.data.expiresAt).toISOString() : null,
+    })
+    .select("id, name, prefix, createdAt, expiresAt")
+    .single();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
 
   return NextResponse.json(
     ok(

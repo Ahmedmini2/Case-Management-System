@@ -1,4 +1,4 @@
-import { CaseStatus, Priority } from "@prisma/client";
+import { CaseStatus, Priority } from "@/types/enums";
 
 export type CaseListItem = {
   id: string;

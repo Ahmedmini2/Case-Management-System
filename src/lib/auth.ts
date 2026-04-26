@@ -1,12 +1,11 @@
-import { PrismaAdapter } from "@auth/prisma-adapter";
-import { UserRole } from "@prisma/client";
+import { UserRole } from "@/types/enums";
 import bcrypt from "bcryptjs";
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import Github from "next-auth/providers/github";
 import Google from "next-auth/providers/google";
 import { z } from "zod";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const credentialsSchema = z.object({
   email: z.string().email(),
@@ -14,7 +13,6 @@ const credentialsSchema = z.object({
 });
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
-  adapter: PrismaAdapter(db),
   session: { strategy: "jwt" },
   trustHost: true,
   pages: {
@@ -41,9 +39,25 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           return null;
         }
 
-        const user = await db.user.findUnique({
-          where: { email: parsed.data.email },
-        });
+        const sb = supabaseAdmin();
+        const { data: userRow } = await sb
+          .from("users")
+          .select("id, email, name, image, role, passwordHash, isActive")
+          .eq("email", parsed.data.email)
+          .maybeSingle();
+
+        const user = userRow as
+          | {
+              id: string;
+              email: string;
+              name: string | null;
+              image: string | null;
+              role: UserRole;
+              passwordHash: string | null;
+              isActive: boolean;
+            }
+          | null;
+
         if (!user?.passwordHash || !user.isActive) {
           return null;
         }

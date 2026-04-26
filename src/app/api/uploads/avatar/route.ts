@@ -1,9 +1,8 @@
 import { randomUUID } from "crypto";
-import { mkdir, writeFile } from "fs/promises";
-import path from "path";
 import { NextResponse } from "next/server";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
+import { StorageBuckets, uploadToBucket } from "@/lib/supabase/storage";
 
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024;
 const ALLOWED_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
@@ -27,13 +26,15 @@ export async function POST(request: Request) {
   }
 
   const ext = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
-  const fileName = `${randomUUID()}.${ext}`;
-  const uploadsDir = path.join(process.cwd(), "public", "uploads", "avatars");
-  await mkdir(uploadsDir, { recursive: true });
-  const outputPath = path.join(uploadsDir, fileName);
+  const key = `${session.user.id}/${randomUUID()}.${ext}`;
 
-  const bytes = await file.arrayBuffer();
-  await writeFile(outputPath, Buffer.from(bytes));
-
-  return NextResponse.json(ok({ url: `/uploads/avatars/${fileName}` }));
+  try {
+    const uploaded = await uploadToBucket(StorageBuckets.Avatars, key, file, file.type);
+    return NextResponse.json(ok({ url: uploaded.url }));
+  } catch (err) {
+    return NextResponse.json(
+      fail(err instanceof Error ? err.message : "Upload failed"),
+      { status: 500 },
+    );
+  }
 }

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const updateSchema = z.object({
   name: z.string().min(2).max(120).optional(),
@@ -22,25 +22,32 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     return NextResponse.json(fail("Invalid request body"), { status: 400 });
   }
 
+  const sb = supabaseAdmin();
+
   if (parsed.data.email) {
-    const existing = await db.user.findFirst({
-      where: { email: parsed.data.email, id: { not: id } },
-      select: { id: true },
-    });
+    const { data: existing } = await sb
+      .from("users")
+      .select("id")
+      .eq("email", parsed.data.email)
+      .neq("id", id)
+      .maybeSingle();
     if (existing) {
       return NextResponse.json(fail("Email already exists"), { status: 409 });
     }
   }
 
-  const updated = await db.user.update({
-    where: { id },
-    data: {
-      ...(typeof parsed.data.name !== "undefined" ? { name: parsed.data.name } : {}),
-      ...(typeof parsed.data.email !== "undefined" ? { email: parsed.data.email } : {}),
-      ...(typeof parsed.data.image !== "undefined" ? { image: parsed.data.image } : {}),
-    },
-    select: { id: true, name: true, email: true, image: true, role: true, updatedAt: true },
-  });
+  const updateData: Record<string, unknown> = {};
+  if (typeof parsed.data.name !== "undefined") updateData.name = parsed.data.name;
+  if (typeof parsed.data.email !== "undefined") updateData.email = parsed.data.email;
+  if (typeof parsed.data.image !== "undefined") updateData.image = parsed.data.image;
 
-  return NextResponse.json(ok(updated));
+  const { data, error } = await sb
+    .from("users")
+    .update(updateData)
+    .eq("id", id)
+    .select("id, name, email, image, role, updatedAt")
+    .single();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data));
 }

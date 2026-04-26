@@ -1,16 +1,25 @@
 import Link from "next/link";
 import { AutomationBuilder } from "@/components/automations/AutomationBuilder";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export default async function AutomationsPage() {
   const session = await auth();
   if (!session?.user?.id) return null;
 
-  const items = await db.automation.findMany({
-    orderBy: { createdAt: "desc" },
-    select: { id: true, name: true, isActive: true, runCount: true, lastRunAt: true },
-  });
+  const sb = supabaseAdmin();
+  const { data } = await sb
+    .from("automations")
+    .select("id, name, isActive, runCount, lastRunAt")
+    .order("createdAt", { ascending: false });
+
+  const items = (data ?? []) as {
+    id: string;
+    name: string;
+    isActive: boolean;
+    runCount: number;
+    lastRunAt: string | null;
+  }[];
 
   return (
     <div className="space-y-6">

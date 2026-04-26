@@ -1,4 +1,4 @@
-import { Priority } from "@prisma/client";
+import { Priority } from "@/types/enums";
 import { cn } from "@/lib/utils";
 
 const priorityConfig: Record<

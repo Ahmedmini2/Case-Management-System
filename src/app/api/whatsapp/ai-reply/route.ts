@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { triggerPusherEvent } from "@/lib/pusher";
 
 // Called by the AI agent (n8n) to send a reply through our system
@@ -18,16 +18,25 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Message body is required" }, { status: 400 });
     }
 
+    const sb = supabaseAdmin();
+
     // Find conversation by ID or phone number
-    let conversation;
+    type Conv = { id: string; contactPhone: string; handledBy: string };
+    let conversation: Conv | null = null;
     if (body.conversationId) {
-      conversation = await db.whatsAppConversation.findUnique({
-        where: { id: body.conversationId },
-      });
+      const { data } = await sb
+        .from("whatsapp_conversations")
+        .select("id, contactPhone, handledBy")
+        .eq("id", body.conversationId)
+        .maybeSingle();
+      conversation = (data as Conv | null) ?? null;
     } else if (body.contactPhone) {
-      conversation = await db.whatsAppConversation.findUnique({
-        where: { contactPhone: body.contactPhone },
-      });
+      const { data } = await sb
+        .from("whatsapp_conversations")
+        .select("id, contactPhone, handledBy")
+        .eq("contactPhone", body.contactPhone)
+        .maybeSingle();
+      conversation = (data as Conv | null) ?? null;
     }
 
     if (!conversation) {
@@ -79,8 +88,9 @@ export async function POST(request: Request) {
     }
 
     // Save AI reply to DB
-    const message = await db.whatsAppMessage.create({
-      data: {
+    const { data: msgRow, error: msgErr } = await sb
+      .from("whatsapp_messages")
+      .insert({
         conversationId: conversation.id,
         whatsappMsgId: waMessageId,
         direction: "outbound",
@@ -90,17 +100,23 @@ export async function POST(request: Request) {
         isAI: true,
         status: waMessageId ? "sent" : "failed",
         isRead: true,
-      },
-    });
+      })
+      .select("id")
+      .single();
+
+    if (msgErr || !msgRow) {
+      return NextResponse.json({ error: msgErr?.message ?? "Failed to save message" }, { status: 500 });
+    }
+    const message = msgRow as { id: string };
 
     // Update conversation last message
-    await db.whatsAppConversation.update({
-      where: { id: conversation.id },
-      data: {
+    await sb
+      .from("whatsapp_conversations")
+      .update({
         lastMessage: messageBody.length > 200 ? messageBody.slice(0, 200) + "..." : messageBody,
-        lastMessageAt: new Date(),
-      },
-    });
+        lastMessageAt: new Date().toISOString(),
+      })
+      .eq("id", conversation.id);
 
     // Push real-time update
     await triggerPusherEvent(
@@ -112,6 +128,7 @@ export async function POST(request: Request) {
       conversationId: conversation.id,
     });
 
+    void request;
     return NextResponse.json({
       success: true,
       messageId: message.id,

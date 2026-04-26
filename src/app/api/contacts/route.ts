@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { fail, ok } from "@/lib/api";
 import { auth } from "@/lib/auth";
-import { db } from "@/lib/prisma";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 const createSchema = z.object({
   name: z.string().min(2).max(120),
@@ -15,19 +15,34 @@ export async function GET() {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json(fail("Unauthorized"), { status: 401 });
 
-  const contacts = await db.contact.findMany({
-    orderBy: { createdAt: "desc" },
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      phone: true,
-      company: true,
-      createdAt: true,
-      _count: { select: { cases: true } },
-    },
-  });
-  return NextResponse.json(ok(contacts, { total: contacts.length }));
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("contacts")
+    .select("id, name, email, phone, company, createdAt, cases(count)")
+    .order("createdAt", { ascending: false });
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+
+  type Row = {
+    id: string;
+    name: string;
+    email: string | null;
+    phone: string | null;
+    company: string | null;
+    createdAt: string;
+    cases?: Array<{ count: number }>;
+  };
+  const enriched = (data as Row[] | null ?? []).map((c) => ({
+    id: c.id,
+    name: c.name,
+    email: c.email,
+    phone: c.phone,
+    company: c.company,
+    createdAt: c.createdAt,
+    _count: { cases: c.cases?.[0]?.count ?? 0 },
+  }));
+
+  return NextResponse.json(ok(enriched, { total: enriched.length }));
 }
 
 export async function POST(request: Request) {
@@ -37,9 +52,13 @@ export async function POST(request: Request) {
   const parsed = createSchema.safeParse(await request.json());
   if (!parsed.success) return NextResponse.json(fail("Invalid request body"), { status: 400 });
 
-  const created = await db.contact.create({
-    data: parsed.data,
-    select: { id: true, name: true, email: true, phone: true, company: true, createdAt: true },
-  });
-  return NextResponse.json(ok(created), { status: 201 });
+  const sb = supabaseAdmin();
+  const { data, error } = await sb
+    .from("contacts")
+    .insert(parsed.data)
+    .select("id, name, email, phone, company, createdAt")
+    .single();
+
+  if (error) return NextResponse.json(fail(error.message), { status: 500 });
+  return NextResponse.json(ok(data), { status: 201 });
 }

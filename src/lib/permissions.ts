@@ -1,4 +1,4 @@
-import { UserRole } from "@prisma/client";
+import { UserRole } from "@/types/enums";
 
 export type PermissionKey =
   | "cases.read"
