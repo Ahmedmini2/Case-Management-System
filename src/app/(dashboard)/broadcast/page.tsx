@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import {
   Send, Upload, Plus, Trash2, Play, CheckCircle2, XCircle, Clock,
   Loader2, FileSpreadsheet, Users, ArrowLeft, X, Phone, AlertCircle,
-  Radio, RefreshCw, FileText, Sparkles, Clock,
+  Radio, RefreshCw, FileText, Sparkles,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
