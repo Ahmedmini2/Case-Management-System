@@ -287,9 +287,24 @@ export async function POST(request: Request) {
 
   try {
     const json = await request.json();
+
+    // n8n / Zapier commonly send "" for fields the trigger didn't fill. Treat empty/whitespace-only
+    // strings as omitted so optional validators don't trip on them.
+    if (json && typeof json === "object") {
+      for (const k of Object.keys(json as Record<string, unknown>)) {
+        const v = (json as Record<string, unknown>)[k];
+        if (typeof v === "string" && v.trim() === "") {
+          delete (json as Record<string, unknown>)[k];
+        }
+      }
+    }
+
     const parsed = createCaseSchema.safeParse(json);
     if (!parsed.success) {
-      return NextResponse.json(fail("Invalid request body"), { status: 400 });
+      const detail = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return NextResponse.json(fail(`Invalid request body — ${detail}`), { status: 400 });
     }
 
     const sb = supabaseAdmin();
